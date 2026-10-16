@@ -17,8 +17,12 @@ set -euo pipefail
 # ============================================================
 # 配置(可用环境变量覆盖)
 # ============================================================
-CORAL_REPO="${CORAL_REPO:-https://android.googlesource.com/kernel/google/coral}"
-KERNEL_BRANCH="${KERNEL_BRANCH:-android13-d1-release}"
+# coral 内核在 AOSP 上没有公开的 kernel 树,官方遗留分支是
+# `device/google/coral-kernel`(只含 device config,不含源码)。
+# community 维护的镜像使用 "floral" 作设备代号(Pixel 4 / 4 XL 共用),
+# 内置 KernelSU 集成。这里默认从社区维护的 msnx/KernelSU-Pixel4XL 拉取。
+CORAL_REPO="${CORAL_REPO:-https://github.com/msnx/KernelSU-Pixel4XL}"
+KERNEL_BRANCH="${KERNEL_BRANCH:-main}"
 KERNEL_DIR="${KERNEL_DIR:-kernel/google-coral}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
@@ -123,7 +127,7 @@ cmd_compile() {
                 cat > build.config <<'EOF'
 . ${ROOT_DIR}/build.config.common
 . ${ROOT_DIR}/build.config.gki
-DEFCONFIG=coral_defconfig
+DEFCONFIG=floral_defconfig
 EOF
             fi
             ok "创建 build.config"

@@ -10,13 +10,13 @@
 
 **症状**:
 ```
-fatal: unable to access 'https://android.googlesource.com/kernel/google/coral/'
+fatal: unable to access 'https://github.com/msnx/KernelSU-Pixel4XL/'
 ```
 
 **排查**:
 ```bash
 # 测试连通性
-curl -I https://android.googlesource.com/kernel/google/coral
+curl -I https://github.com/msnx/KernelSU-Pixel4XL
 
 # 如果连接超时,需要配 proxy
 export https_proxy=http://127.0.0.1:7890
@@ -25,8 +25,13 @@ git config --global http.proxy $https_proxy
 
 如果是自建 mirror:
 ```bash
-CORAL_REPO=https://github.com/mirror/coral.git ./scripts/build.sh fetch
+CORAL_REPO=https://github.com/your-fork/coral-kernel.git ./scripts/build.sh fetch
 ```
+
+> **历史**:`https://android.googlesource.com/kernel/google/coral` 路径在 AOSP 上不存在
+> (官方遗留分支是 `device/google/coral-kernel`,只含 device config,没有 kernel 源码)。
+> CI / `scripts/build.sh` 现已默认改用 community 镜像 `msnx/KernelSU-Pixel4XL`。
+> 想用其他镜像,设置 `CORAL_REPO` / `KERNEL_BRANCH` 环境变量即可。
 
 ### Q2: `error: Cannot find a v5.10 or higher kernel`
 

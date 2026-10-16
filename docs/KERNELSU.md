@@ -99,10 +99,16 @@ cp -r susfs/kernel_patches/fs/susfs fs/
 ## Pixel 4XL (coral) Android 13 适配情况
 
 ### 内核版本
-- `android13-d1-release` 分支基于 **Linux 5.10.123+**
-- 这是 Pixel 4XL 出厂后 Google 维护的稳定分支
+- 源码: [`msnx/KernelSU-Pixel4XL`](https://github.com/msnx/KernelSU-Pixel4XL) `main` 分支
+- 内核基础: **Linux 5.10.123+**(`android-msm-coral-4.14-android13` legacy 树)
+- 设备代号: `floral`(Pixel 4 / 4 XL 共用)
 - KernelSU 0.7.x+ 支持 5.10
 - SUSFS v2.3.0 适配 5.10
+
+> **历史**:`android13-d1-release` 是 AOSP `kernel/manifest` 上的 repo manifest 分支名
+> (用 `repo init -u .../kernel/manifest -b android13-d1-release` 拉整棵 manifest),
+> 不是某个 git 仓库的分支名。`msnx/KernelSU-Pixel4XL` 的 `main` 分支就是该 manifest
+> 在 coral 设备上的实际产出。
 
 ### GKI vs 非 GKI
 

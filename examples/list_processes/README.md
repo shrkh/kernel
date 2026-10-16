@@ -173,7 +173,7 @@ git checkout <正确版本tag>
 ### Q:报 "Required key not available"
 
 模块签名问题。两种方案:
-1. 关闭模块签名要求:在 `coral_defconfig` 改 `CONFIG_MODULES=n` 或者开启 `CONFIG_MODULE_SIG_FORCE=n`
+1. 关闭模块签名要求:在 `floral_defconfig` 改 `CONFIG_MODULES=n` 或者开启 `CONFIG_MODULE_SIG_FORCE=n`
 2. 自己签名:用自己生成的私钥签模块
 
 ### Q:报 "Operation not permitted"

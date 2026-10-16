@@ -120,9 +120,14 @@ python3 scripts/extract_vendor.py \
 
 ### 内核来源
 
-- 仓库: [`android.googlesource.com/kernel/google/coral`](https://android.googlesource.com/kernel/google/coral)
-- 分支: `android13-d1-release`(Pixel 4XL Android 13 稳定分支)
-- 配置: `arch/arm64/configs/coral_defconfig`
+- 仓库: [`msnx/KernelSU-Pixel4XL`](https://github.com/msnx/KernelSU-Pixel4XL)
+- 分支: `main`(Pixel 4 / 4 XL 共用 "floral" 内核;社区镜像已预集成 KernelSU)
+- 配置: `arch/arm64/configs/floral_defconfig`
+
+> **历史说明**:`android.googlesource.com/kernel/google/coral` 路径不存在(404),
+> 官方遗留分支是 `device/google/coral-kernel`(只含 device config,不含 kernel 源码)。
+> community 维护的 `msnx/KernelSU-Pixel4XL` 是目前最稳定的 Pixel 4 XL Android 13 内核源,
+> 已合并 KernelSU + SUSFS,可直接编译。
 
 ### 私有 device tree 问题
 

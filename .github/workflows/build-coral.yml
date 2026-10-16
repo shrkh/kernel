@@ -34,13 +34,15 @@ on:
   workflow_dispatch:
     inputs:
       kernel_branch:
-        description: 'coral 内核分支'
-        default: 'android13-d1-release'
+        description: 'coral 内核分支(msnx/KernelSU-Pixel4XL 只提供 main)'
+        default: 'main'
         type: choice
         options:
-          - android13-d1-release
-          - android13-d1-s1-release
-          - android13-d1-s2-release
+          - main
+      kernel_repo:
+        description: 'coral 内核仓库 URL(默认 msnx/KernelSU-Pixel4XL,已预集成 KSU)'
+        default: 'https://github.com/msnx/KernelSU-Pixel4XL'
+        type: string
       kernelsu_repo:
         description: 'KernelSU (BakaSU) 仓库'
         default: 'https://github.com/tiann/KernelSU'
@@ -152,7 +154,11 @@ jobs:
         env:
           KSU_REPO: ${{ inputs.kernelsu_repo || secrets.BAKASU_REPO || 'https://github.com/tiann/KernelSU' }}
           KSU_BRANCH: ${{ inputs.kernelsu_branch || secrets.BAKASU_BRANCH || 'main' }}
-          KERNEL_BRANCH: ${{ inputs.kernel_branch || 'android13-d1-release' }}
+          KERNEL_BRANCH: ${{ inputs.kernel_branch || 'main' }}
+          # coral 内核在 community 仓库 msnx/KernelSU-Pixel4XL (Pixel 4 / 4 XL 共用 "floral" 内核)。
+          # 上游 AOSP `android.googlesource.com/kernel/google/coral/` 不存在(404);
+          # 官方遗留分支是 `device/google/coral-kernel` 而非 kernel 树,无法直接 git clone。
+          KERNEL_REPO: ${{ inputs.kernel_repo || secrets.CORAL_KERNEL_REPO || 'https://github.com/msnx/KernelSU-Pixel4XL' }}
         run: |
           cd "$WORK_DIR"
 
@@ -162,32 +168,39 @@ jobs:
           KSU_HEAD=$(git -C KernelSU rev-parse --short HEAD)
           echo "KernelSU HEAD: $KSU_HEAD"
 
-          # 2. 拉取 coral 内核源码
-          echo "Clone coral kernel: $KERNEL_BRANCH"
+          # 2. 拉取 coral 内核源码(msnx/KernelSU-Pixel4XL 已内置 KSU,这里克隆的是其源代码)
+          echo "Clone coral kernel: $KERNEL_REPO @ $KERNEL_BRANCH"
           git clone --depth=1 --branch "$KERNEL_BRANCH" \
-            https://android.googlesource.com/kernel/google/coral \
+            "$KERNEL_REPO" \
             "$KERNEL_DIR"
           CORAL_HEAD=$(git -C "$KERNEL_DIR" rev-parse --short HEAD)
           echo "coral HEAD: $CORAL_HEAD"
 
           # 3. 备份并改写 build.config(去掉私有 device tree)
           cd "$KERNEL_DIR"
-          cp build/build.config.coral build/build.config.coral.bak 2>/dev/null || true
-          if grep -q "private/google-modules" build/build.config.coral 2>/dev/null; then
-            echo "WARN: build.config.coral 引用私有 device tree,改用 build.config.gki"
+          cp build/build.config.coral build/build.config.coral.bak 2>/dev/null || \
+            cp build/build.config.floral build/build.config.floral.bak 2>/dev/null || true
+          if grep -q "private/google-modules" build/build.config.coral 2>/dev/null || \
+             grep -q "private/google-modules" build/build.config.floral 2>/dev/null; then
+            echo "WARN: build.config.coral/floral 引用私有 device tree,改用 build.config.gki"
           fi
           if [[ -f build/build.config.gki ]]; then
             ln -sf build/build.config.gki build.config
           else
+            # fallback: 写一个最小 GKI 配置(msnx 仓库的 build.config.* 通常依赖
+            # private/msm-google,这里直接走 GKI + floral_defconfig 路径,
+            # 对应 Pixel 4 / 4 XL 共用的 "floral" defconfig)。
             printf '%s\n' \
               '. ${ROOT_DIR}/build.config.common' \
               '. ${ROOT_DIR}/build.config.gki' \
-              'DEFCONFIG=coral_defconfig' \
+              'DEFCONFIG=floral_defconfig' \
               > build.config
           fi
           cat build.config
 
           # 4. 应用 KernelSU/BakaSU 的 patch(如果有)
+          #    注意:msnx/KernelSU-Pixel4XL 仓库已经预集成了 KernelSU,
+          #    这里的 patch 应用步骤会因 "already applied" 全部 skip,不会破坏构建。
           KSU_PATCH_DIR="$WORK_DIR/KernelSU/kernel"
           if [[ -d "$KSU_PATCH_DIR" ]]; then
             mapfile -t KSU_PATCHES < <(find "$KSU_PATCH_DIR" \( -name "*.patch" -o -name "*.diff" \) | sort)
@@ -363,8 +376,9 @@ jobs:
             cp stock_ikconfig.txt .config
             echo "使用 stock .config"
           else
-            echo "stock .config 不可用,用 coral_defconfig"
-            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+            echo "stock .config 不可用,用 floral_defconfig"
+            echo "(Pixel 4 / 4 XL 共用 'floral' defconfig — 见 build_coral.sh)"
+            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- floral_defconfig
           fi
 
           # 2. 开启 BakaSU(KernelSU)配置

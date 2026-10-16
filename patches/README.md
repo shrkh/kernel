@@ -19,8 +19,8 @@
 ```bash
 cd kernel/google-coral
 
-# 1. 切到干净分支
-git checkout -b my-patches android13-d1-release
+# 1. 切到干净分支(msnx/KernelSU-Pixel4XL 用 main;Pixel 4 / 4 XL 共用 "floral" 内核)
+git checkout -b my-patches main
 
 # 2. 改代码
 vim drivers/net/wireless/...
@@ -68,7 +68,7 @@ git apply -R ../patches/0001-some-patch.patch
 
 - **vendor/Qualcomm 模块修改** — 这些由 `scripts/extract_vendor.py` 拆出来的模块决定,不在源码里改
 - **dtb/dtbo 修改** — 需要不同的工具链(不是 git apply 能处理)
-- **kernel config 改动** — 应通过修改 `arch/arm64/configs/coral_defconfig` 后重新生成 patch
+- **kernel config 改动** — 应通过修改 `arch/arm64/configs/floral_defconfig` 后重新生成 patch
 
 ## 例子
 
