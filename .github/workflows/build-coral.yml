@@ -1,0 +1,362 @@
+# GitHub Actions: Build coral (Pixel 4XL) Android 13 内核
+#
+# 触发矩阵:
+#   - pull_request:  构建 + 上传 artifact(让维护者从 PR 里下载测试),不发布 release
+#   - push to main:  构建 + 上传 artifact,自动 commit vendor_modules 的更新(可选)
+#   - tag v*:        构建 + 创建 GitHub Release + 上传 boot.img + load_order
+#   - workflow_dispatch: 手动触发,可选自定义 factory URL
+#
+# 产物:
+#   - out/arch/arm64/boot/Image.gz-dtb   内核 + DTB 打包镜像
+#   - out/dist/boot.img                 boot.img(如果 build.sh 成功打 img)
+#   - vendor_modules/load_order.txt     vendor 模块加载顺序
+#   - vendor_modules/manifest.json      元信息
+
+name: Build coral kernel
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-coral.yml'
+      - 'kernel/**'
+      - 'patches/**'
+      - 'scripts/**'
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      factory_url:
+        description: 'Pixel 4XL 工厂镜像 URL(留空用上次缓存的 vendor_modules)'
+        required: false
+        type: string
+      kernel_branch:
+        description: 'coral 内核仓库分支'
+        default: 'android13-d1-release'
+        type: choice
+        options: [android13-d1-release, android13-d1-s1-release, android13-d1-s2-release]
+
+# 默认 timeout: 180 分钟,Pixel 4XL 5.10 内核冷编译约 25 分钟
+# 最小权限: tag 上传 release 需要 contents: write
+permissions:
+  contents: write
+
+concurrency:
+  # 同一分支/Tag 串行,避免跑重复构建;旧的 PR 立即取消
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # 默认内核仓库(若项目里有 kernel/ 目录并自带源码,则置空用本地)
+  CORAL_REPO: https://android.googlesource.com/kernel/google/coral
+  KERNEL_DIR: kernel/google-coral
+  CCACHE_DIR: ~/.ccache
+  CCACHE_MAXSIZE: 20G
+
+jobs:
+  # =============================================================
+  # Job 1: 拆 vendor 模块(只在主分支或手动触发时跑,避免每个 PR 都拉 ~2GB 工厂镜像)
+  # =============================================================
+  extract-vendor:
+    name: Extract vendor modules
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    outputs:
+      manifest-sha: ${{ steps.hash.outputs.sha }}
+      kernel-version: ${{ steps.manifest.outputs.kernel }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            e2fsprogs unzip curl xz-utils python3 rsync
+          # simg2img 不在 apt,从 GitHub Release 拿 prebuilt
+          sudo curl -fsSL https://github.com/anestisb/android-simg2img/releases/download/v1.1.0/simg2img \
+            -o /usr/local/bin/simg2img
+          sudo chmod +x /usr/local/bin/simg2img
+          simg2img -h && echo "simg2img OK"
+
+      - name: 选择工厂镜像 URL
+        id: factory
+        env:
+          USER_FACTORY: ${{ inputs.factory_url }}
+          SECRET_FACTORY: ${{ secrets.CORAL_FACTORY_URL }}
+        run: |
+          mkdir -p artifacts
+          # 优先级: workflow_dispatch input > secret > 公开 stock URL
+          if [ -n "$USER_FACTORY" ]; then
+            FACTORY="$USER_FACTORY"
+          elif [ -n "$SECRET_FACTORY" ]; then
+            FACTORY="$SECRET_FACTORY"
+          else
+            # Pixel 4XL Android 13 SP2A.220505.008 工厂镜像的稳定 URL
+            # 注意: 此 URL 会随 Google 推送新版本过期
+            FACTORY="https://dl.google.com/dl/android/aosp/coral-sp2a.220505.008-factory-b1d35049.zip"
+          fi
+          echo "url=$FACTORY" >> "$GITHUB_OUTPUT"
+          echo "工厂镜像: $FACTORY"
+
+      - name: 下载工厂镜像
+        run: |
+          cd artifacts
+          curl -fLO --retry 3 --retry-delay 5 "$FACTORY"
+          ls -lh
+
+      - name: 拆 vendor_dlkm
+        run: |
+          ZIP=$(ls artifacts/*.zip | head -n 1)
+          python3 scripts/extract_vendor.py "$ZIP" vendor_modules/
+
+      - name: 读 manifest
+        id: manifest
+        run: |
+          cat vendor_modules/manifest.json
+          KERNEL=$(jq -r .kernel_version vendor_modules/manifest.json)
+          echo "kernel=$KERNEL" >> "$GITHUB_OUTPUT"
+
+      - name: 算 manifest 的 hash(给缓存 key 用)
+        id: hash
+        run: |
+          SHA=$(sha256sum vendor_modules/manifest.json | cut -d' ' -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: 上传 vendor 模块(给 build job 用)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coral-vendor-${{ steps.hash.outputs.sha }}
+          path: vendor_modules/
+          retention-days: 7
+
+      - name: 缓存 vendor_modules(PR job 复用)
+        uses: actions/cache@v4
+        with:
+          path: vendor_modules/
+          key: vendor-${{ steps.hash.outputs.sha }}
+          restore-keys: |
+            vendor-
+
+  # =============================================================
+  # Job 2: 编译内核(所有触发条件都跑)
+  # =============================================================
+  build:
+    name: Build kernel
+    runs-on: ubuntu-22.04
+    needs: extract-vendor
+    if: always() && (needs.extract-vendor.result == 'success' || needs.extract-vendor.result == 'skipped')
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison ccache flex \
+            libssl-dev libelf-dev dwarves rsync cpio \
+            unzip xz-utils curl xxd git python3 python2 \
+            e2fsprogs
+          # simg2img 备用(虽然 build.sh 会自己下)
+          sudo curl -fsSL https://github.com/anestisb/android-simg2img/releases/download/v1.1.0/simg2img \
+            -o /usr/local/bin/simg2img
+          sudo chmod +x /usr/local/bin/simg2img
+
+      - name: 恢复 vendor_modules 缓存
+        uses: actions/cache@v4
+        with:
+          path: vendor_modules/
+          key: vendor-${{ needs.extract-vendor.outputs.manifest-sha }}
+          restore-keys: |
+            vendor-
+
+      - name: 下载 vendor_modules artifact(若 cache miss)
+        uses: actions/download-artifact@v4
+        with:
+          name: coral-vendor-${{ needs.extract-vendor.outputs.manifest-sha }}
+          path: vendor_modules/
+        if: needs.extract-vendor.outputs.manifest-sha != ''
+
+      - name: 验证 vendor_modules
+        run: |
+          if [ ! -f vendor_modules/load_order.txt ]; then
+            echo "ERROR: vendor_modules/load_order.txt 不存在"
+            echo "extract-vendor job: ${{ needs.extract-vendor.result }}"
+            exit 1
+          fi
+          wc -l vendor_modules/load_order.txt
+          jq . vendor_modules/manifest.json
+
+      - name: 恢复 ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ github.run_id }}
+          restore-keys: |
+            ccache-
+
+      - name: 配置 ccache
+        run: ccache -M ${{ env.CCACHE_MAXSIZE }}
+
+      - name: 拉取 coral 内核源码
+        run: |
+          BRANCH="${{ inputs.kernel_branch || 'android13-d1-release' }}"
+          mkdir -p $(dirname "$KERNEL_DIR")
+          git clone --depth=1 --branch "$BRANCH" "$CORAL_REPO" "$KERNEL_DIR"
+          cd "$KERNEL_DIR"
+          # 检查 BUILD_CONFIG 是否依赖私有 device tree
+          if grep -q "private/google-modules" build/build.config.coral 2>/dev/null; then
+            echo "WARN: build.config.coral 引用私有 device tree,自动切换到 build.config.gki"
+          fi
+
+      - name: 修正 build.config(去掉私有引用)
+        run: |
+          cd "$KERNEL_DIR"
+          # 备份原始
+          cp build/build.config.coral build/build.config.coral.bak 2>/dev/null || true
+          # 如果存在 build.config.gki,用它;否则写一个纯 GKI 的
+          if [ -f build/build.config.gki ]; then
+            ln -sf build.config.gki build.config
+          else
+            cat > build.config <<'EOF'
+          . ${ROOT_DIR}/build.config.common
+          . ${ROOT_DIR}/build.config.gki
+          DEFCONFIG=coral_defconfig
+          EOF
+          fi
+          cat build.config
+
+      - name: 应用项目内自定义 patch(如果有)
+        run: |
+          if [ -d patches/ ]; then
+            cd "$KERNEL_DIR"
+            for p in ../../patches/*.patch; do
+              [ -f "$p" ] || continue
+              echo "Apply $p"
+              git apply --check "$p" || { echo "patch apply failed: $p"; exit 1; }
+              git apply "$p"
+            done
+          fi
+
+      - name: 用 AOSP build.sh 编译
+        env:
+          BUILD_CONFIG: build.config
+        run: |
+          cd "$KERNEL_DIR"
+          ./build/build.sh 2>&1 | tee ../build.log
+          echo "---- 产物 ----"
+          ls -lh out/arch/arm64/boot/ 2>/dev/null || true
+          ls -lh out/dist/ 2>/dev/null || true
+
+      - name: 把 vendor_modules 拷到 out/(便于打包)
+        run: |
+          mkdir -p ${{ env.KERNEL_DIR }}/out/vendor_modules
+          cp -r vendor_modules/* ${{ env.KERNEL_DIR }}/out/vendor_modules/ 2>/dev/null || true
+
+      - name: 重新打包 boot.img(合并 vendor)
+        run: |
+          # 如果 build.sh 没打 img,在 out/ 手动拼
+          cd ${{ env.KERNEL_DIR }}
+          if [ ! -f out/dist/boot.img ]; then
+            echo "boot.img 未自动生成,需要自定义 mkbootimg 步骤"
+            echo "如果用 mkbootimg,请确保 out/arch/arm64/boot/Image.gz-dtb 已存在"
+            ls out/arch/arm64/boot/ || { echo "no kernel image found"; exit 1; }
+          fi
+
+      - name: 准备发布产物
+        id: prepare
+        run: |
+          mkdir -p release_artifacts
+          # 复制内核镜像
+          if [ -f ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz-dtb release_artifacts/
+          fi
+          # 复制 boot.img(如果生成)
+          if [ -f ${{ env.KERNEL_DIR }}/out/dist/boot.img ]; then
+            cp ${{ env.KERNEL_DIR }}/out/dist/boot.img release_artifacts/
+          fi
+          # 复制 vendor 加载顺序
+          cp vendor_modules/load_order.txt release_artifacts/
+          cp vendor_modules/manifest.json release_artifacts/
+          ls -lh release_artifacts/
+
+      - name: 上传构建产物(给 PR 测试用)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coral-kernel-${{ github.sha }}
+          path: release_artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  # =============================================================
+  # Job 3: 创建 GitHub Release(仅 tag 触发)
+  # =============================================================
+  release:
+    name: Create release
+    runs-on: ubuntu-22.04
+    needs: [extract-vendor, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: coral-kernel-${{ github.sha }}
+          path: release_artifacts/
+
+      - name: 下载 vendor_modules
+        uses: actions/download-artifact@v4
+        with:
+          name: coral-vendor-${{ needs.extract-vendor.outputs.manifest-sha }}
+          path: vendor_modules/
+
+      - name: 生成 release notes
+        env:
+          KERNEL_VER: ${{ needs.extract-vendor.outputs.kernel-version }}
+        run: |
+          cat > release_notes.md <<EOF
+          ## Pixel 4XL (coral) 内核构建
+
+          - **Tag**: \`${{ github.ref_name }}\`
+          - **Commit**: \`${{ github.sha }}\`
+          - **触发**: ${{ github.event_name }} by @${{ github.actor }}
+          - **内核版本**: \`${KERNEL_VER}\`
+
+          ### 产物说明
+          - \`Image.gz-dtb\` — 内核 + DTB 压缩镜像,用于替换 core kernel 内核镜像
+          - \`boot.img\` — 完整 boot 镜像(如果生成)
+          - \`load_order.txt\` — vendor 模块加载顺序
+          - \`manifest.json\` — 构建元信息
+
+          ### 刷机方法
+          1. \`fastboot boot boot.img\` — 试启动(不刷写,验证能否开机)
+          2. 确认 OK 后: \`fastboot flash boot boot.img\`
+          3. 重启: \`fastboot reboot\`
+
+          EOF
+          cat release_notes.md
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Pixel 4XL Kernel ${{ github.ref_name }}"
+          body_path: release_notes.md
+          files: |
+            release_artifacts/Image.gz-dtb
+            release_artifacts/boot.img
+            release_artifacts/load_order.txt
+            release_artifacts/manifest.json
+          fail_on_unmatched_files: false
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
