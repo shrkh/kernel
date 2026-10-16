@@ -250,26 +250,53 @@ jobs:
           CORAL_HEAD=$(smart_clone "$KERNEL_REPO" "$KERNEL_BRANCH" "$KERNEL_DIR")
           echo "coral HEAD: $CORAL_HEAD"
 
-          # 3. 备份并改写 build.config(去掉私有 device tree)
+          # 3. 备份并选择 build.config(去掉私有 device tree 引用)
           cd "$KERNEL_DIR"
-          cp build/build.config.coral build/build.config.coral.bak 2>/dev/null || \
-            cp build/build.config.floral build/build.config.floral.bak 2>/dev/null || true
-          if grep -q "private/google-modules" build/build.config.coral 2>/dev/null || \
-             grep -q "private/google-modules" build/build.config.floral 2>/dev/null; then
-            echo "WARN: build.config.coral/floral 引用私有 device tree,改用 build.config.gki"
-          fi
+          # 备份(若有)
+          for cfg in build.config.coral build.config.floral build.config.gki; do
+            [[ -f "build/$cfg" ]] && cp "build/$cfg" "build/$cfg.bak" 2>/dev/null || true
+          done
+          # 优先用 GKI(没有私有依赖),其次 coral/floral(可能有 private/google-modules)
+          # 关键修复:之前 build.config.gki 不存在时,会硬写一个引用 build.config.gki 的 fallback,
+          # 但 msnx 仓库根本没有 build.config.gki → 后面 build.sh 会报 file not found
           if [[ -f build/build.config.gki ]]; then
             ln -sf build/build.config.gki build.config
+            echo "→ build.config -> build.config.gki(标准 GKI)"
+          elif [[ -f build/build.config.coral ]]; then
+            # coral 内核配置,但里面通常 ${ROOT_DIR}/build.config.coral 自身;
+            # msnx 这类 fork 通常已经把 private/google-modules 处理掉,
+            # 直接 link 即可,不要重写内容
+            if grep -q "private/google-modules\|private/msm-google" build/build.config.coral; then
+              echo "::warning::build.config.coral 引用 private/google-modules,尝试走 GKI 替代"
+              # 看看 gki 是不是被 include 进来的(变体常这样写)
+              if grep -q "build.config.gki" build/build.config.coral; then
+                :  # 没问题,正常 include
+              else
+                # 真的引用了私有 device tree — 退到 floral,若 floral 也引就报错
+                if [[ -f build/build.config.floral ]] && \
+                   ! grep -q "private/" build/build.config.floral; then
+                  ln -sf build/build.config.floral build.config
+                  echo "→ build.config -> build.config.floral(避开 private 引用)"
+                else
+                  echo "::error::build.config.coral/floral 都引用私有 device tree,本 runner 没法获取"
+                  echo "  改用 GKI-only 内核树(github.com/begmans/ksu-pixel4xl-gki)或预集成 fork"
+                  exit 1
+                fi
+              fi
+            fi
+            # 标准情况:直接 link coral
+            if [[ ! -L build.config ]]; then
+              ln -sf build/build.config.coral build.config
+              echo "→ build.config -> build.config.coral"
+            fi
+          elif [[ -f build/build.config.floral ]]; then
+            ln -sf build/build.config.floral build.config
+            echo "→ build.config -> build.config.floral"
           else
-            # fallback: 写一个最小 GKI 配置(msnx 仓库的 build.config.* 通常依赖
-            # private/msm-google,这里直接走 GKI + floral_defconfig 路径,
-            # 对应 Pixel 4 / 4 XL 共用的 "floral" defconfig)。
-            printf '%s\n' \
-              '. ${ROOT_DIR}/build.config.common' \
-              '. ${ROOT_DIR}/build.config.gki' \
-              'DEFCONFIG=floral_defconfig' \
-              > build.config
+            echo "::error::找不到任何 build.config.{coral,floral,gki},无法构建"
+            exit 1
           fi
+          echo "---- 当前 build.config ----"
           cat build.config
 
           # 4. 集成 KernelSU/BakaSU(真正的 in-tree 集成)
@@ -286,10 +313,29 @@ jobs:
           #      - vanilla 4.14 coral 内核: 完整执行 a)~d)
           #      - 不支持的版本: 报错退出
           echo "===== 集成 KernelSU/BakaSU ====="
+          # 多指标检测已集成:
+          #   - 标准:drivers/kernelsu/ + Makefile 含 kernelsu
+          #   - fork 自定义:drivers/ 下任何 ksu_*.c / KernelSU_*.c
+          #   - fork 通过 patch 系列:kernel_patches/ 已就位(说明仓库自带集成脚本)
+          #   - msnx/KernelSU-Pixel4XL 风格:Kconfig 里有 CONFIG_KSU,或 include/ 改了 detect
+          pre_integrated=false
           if [[ -d "$KERNEL_DIR/drivers/kernelsu" ]] && \
              grep -q "kernelsu" "$KERNEL_DIR/drivers/Makefile" 2>/dev/null; then
-            echo "✓ 内核已预集成 KernelSU (drivers/kernelsu + Makefile.kernelsu 都存在)"
-            echo "  跳过写入,只做最终验证"
+            pre_integrated=true
+            echo "  检测:drivers/kernelsu + Makefile.kernelsu ✓"
+          fi
+          if ! $pre_integrated && \
+             find "$KERNEL_DIR" -maxdepth 4 -type f \( -name "ksu_*.c" -o -name "KernelSU_*.c" \) 2>/dev/null | grep -q .; then
+            pre_integrated=true
+            echo "  检测:drivers/ 下有 ksu_*.c / KernelSU_*.c ✓"
+          fi
+          if ! $pre_integrated && \
+             grep -rq "CONFIG_KSU\b" "$KERNEL_DIR/Kconfig*" "$KERNEL_DIR/drivers/Kconfig" 2>/dev/null; then
+            pre_integrated=true
+            echo "  检测:Kconfig 已含 CONFIG_KSU ✓"
+          fi
+          if $pre_integrated; then
+            echo "✓ 内核已预集成 KernelSU,跳过写入,只做最终验证"
           else
             echo "→ 内核未集成 KernelSU,执行 in-tree 集成"
             cd "$KERNEL_DIR"
@@ -314,15 +360,71 @@ jobs:
             fi
 
             if [[ ${#PATCH_FILES[@]} -eq 0 ]]; then
+              # ===== 自动回退:4.14 内核用 tiann/KernelSU @ v0.5.2 =====
+              # 历史:KernelSU v0.6.0 起只跟 GKI(5.10+),4.14 patches 被砍;
+              # v0.5.2 是最后一个含 kernel_patches/4.14/ 的 release tag。
+              # 几乎所有 modern fork(backslashxx/backslashxx 等)的 master/main
+              # 都没有 4.14,所以直接 fallback 是最稳的方案。
+              if [[ "$KRN_MAJOR" == "4.14" ]]; then
+                echo "::warning::${KSU_REPO}@${KSU_BRANCH} 没 4.14 patch,自动回退到 tiann/KernelSU @ v0.5.2"
+                cd "$WORK_DIR"
+                rm -rf KernelSU
+                FB_OK=false
+                for fb_repo in \
+                  "https://github.com/tiann/KernelSU|v0.5.2" \
+                  "https://github.com/tiann/KernelSU|master"; do
+                  FB_URL="${fb_repo%|*}"
+                  FB_TAG="${fb_repo#*|}"
+                  echo "  回退尝试: $FB_URL @ $FB_TAG"
+                  attempt=0
+                  while [[ $attempt -lt $GIT_RETRY_COUNT ]]; do
+                    attempt=$((attempt + 1))
+                    if git clone --depth=1 --branch "$FB_TAG" \
+                         --config http.lowSpeedLimit=$GIT_HTTP_LOW_SPEED_LIMIT \
+                         --config http.lowSpeedTime=$GIT_HTTP_LOW_SPEED_TIME \
+                         -- "$FB_URL" KernelSU 2>/dev/null; then
+                      FB_OK=true
+                      break 2
+                    fi
+                    sleep $((attempt * 5))
+                  done
+                done
+                if ! $FB_OK; then
+                  echo "::error::自动回退到 tiann/KernelSU 也无法 clone(网络问题?)"
+                  echo "  手动方案:kernelsu_repo=https://github.com/begmans/ksu-pixel4xl"
+                  exit 1
+                fi
+                KSU_HEAD=$(git -C KernelSU rev-parse --short HEAD)
+                echo "回退成功,新 HEAD: $KSU_HEAD"
+
+                # 重新探测 4.14 patch
+                PATCH_BASE="$WORK_DIR/KernelSU/kernel_patches"
+                if [[ -d "$PATCH_BASE/4.14" ]]; then
+                  mapfile -t PATCH_FILES < <(find "$PATCH_BASE/4.14" -maxdepth 1 -name "*.patch" | sort)
+                  echo "  → 回退后找到 4.14 patch: ${#PATCH_FILES[@]} 个"
+                fi
+              fi
+            fi
+
+            if [[ ${#PATCH_FILES[@]} -eq 0 ]]; then
               echo "::error::KernelSU/kernel_patches/ 找不到 ${KRN_MAJOR} 对应的 patch"
-              echo "  原因:tiann/KernelSU main 分支可能只支持 5.10+ GKI,4.14 需要切旧 commit"
-              echo "  修法 1:用 --branch v0.5.2 等含 4.14 patch 的旧 tag"
-              echo "  修法 2:换 fork(github.com/begmans/ksu-pixel4xl 这类已集成 4.14 的)"
-              echo "  修法 3:继续用 msnx/KernelSU-Pixel4XL(默认已预集成)"
+              echo "  排查清单:"
+              echo "    1. 你指定的 kernelsu_repo(默认 backslashxx/KernelSU)是否包含 ${KRN_MAJOR} 的 patch?"
+              echo "       - tiann/KernelSU main:仅 5.10+ GKI"
+              echo "       - backslashxx/KernelSU master:仅 5.10+"
+              echo "       - tiann/KernelSU @ v0.5.2:含 4.14 patch(应自动回退,否则 4.14 走不通)"
+              echo "    2. 内核树本身是否已经集成 KSU?(drivers/kernelsu 存在会跳过)"
+              echo "    3. 内核版本不在主流支持范围(仅 4.14 / 4.19 / 5.4 / 5.10 / 5.15 / 6.1 测试过)"
+              echo "  解法:"
+              echo "    - kernelsu_repo=https://github.com/tiann/KernelSU, kernelsu_branch=v0.5.2(4.14)"
+              echo "    - 或 kernelsu_repo=https://github.com/begmans/ksu-pixel4xl(已集成 4.14)"
+              echo "    - 或 kernel_repo 改用 msnx/KernelSU-Pixel4XL(默认就是这个)"
               exit 1
             fi
 
             # 4.3 应用 patch
+            #    fallback 可能让我们在 $WORK_DIR,这里强制回到 $KERNEL_DIR
+            cd "$KERNEL_DIR"
             echo "应用 ${#PATCH_FILES[@]} 个 patch:"
             APPLIED=0
             FAILED=0
