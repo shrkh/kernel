@@ -88,6 +88,12 @@ env:
   CLANG_VERSION: '11.0.1'
   # SUSFS 版本只用作日志/显示;susfs4ksu upstream 是按 kernel 树分分支的,
   # 真正的"版本"在 $KERNEL_DIR/fs/susfs.c 的 pr_info 里,不是 tag/branch 名。
+
+  # 工厂镜像(在多个 step 共享:stockconfig 下载、cache key)
+  FACTORY_URL: ${{ inputs.stock_factory || secrets.CORAL_FACTORY_URL || 'https://dl.google.com/dl/android/aosp/coral-tp1a.220624.014-factory-8f60813e.zip' }}
+
+  # 磁盘预检:factory 2.2GB + 解压 ~4GB + ccache 30GB ≈ 36GB,留 6GB 缓冲
+  MIN_FREE_GB: '6'
   # Pixel 4 XL (kernel 4.14) 用 simonpunk/susfs4ksu 的 `kernel-4.14` 分支,
   # 对应 SUSFS v1.5.5(v2.x 是 GKI 5.10+ 的,4.14 用不了)。
   SUSFS_VERSION: '1.5.5'
@@ -130,6 +136,24 @@ jobs:
           echo "KERNEL_DIR=$KERNEL_DIR"
           echo "OUT_DIR=$OUT_DIR"
           df -h $WORK_DIR
+
+      # ============================================================
+      # 磁盘预检 — factory 2.2GB + 解压 ~4GB + 编译产物 + ccache
+      # ============================================================
+      - name: 磁盘空间预检
+        run: |
+          FREE_KB=$(df --output=avail "$WORK_DIR" | tail -1 | tr -d ' ')
+          FREE_GB=$((FREE_KB / 1024 / 1024))
+          echo "WORK_DIR 剩余空间: ${FREE_GB}GB"
+          NEED="$MIN_FREE_GB"
+          if [[ "$FREE_GB" -lt "$NEED" ]]; then
+            echo "::error::磁盘空间不足,需要至少 ${NEED}GB,实际剩余 ${FREE_GB}GB"
+            echo "已用空间明细:"
+            du -sh "$WORK_DIR" "$CCACHE_DIR" "$OUT_DIR" 2>/dev/null | sort -h || true
+            echo "提示:可在 ccache 限速 (CCACHE_MAXSIZE) 或加 -Xmx 给 gradle 上限"
+            exit 1
+          fi
+          echo "磁盘预检通过:剩余 ${FREE_GB}GB >= ${NEED}GB"
 
       # ============================================================
       # 下载 clang 11.0.1 (LLVM 官方 release)
@@ -321,23 +345,73 @@ jobs:
           ls "$KERNEL_DIR" | head
 
       # ============================================================
+      # 缓存 factory.zip — 同一 build 跨 run 复用,2.2GB 不必每次重下
+      # ============================================================
+      - name: 计算 factory cache key
+        id: factory-key
+        run: |
+          # 用 URL 末段(去掉路径和 .zip)做 key
+          # 例:https://dl.google.com/.../coral-tp1a.220624.014-factory-8f60813e.zip
+          #     -> coral-tp1a.220624.014-factory-8f60813e
+          # 同一 build 切不同 CDN 镜像也能命中缓存
+          BASENAME=$(basename "$FACTORY_URL" .zip)
+          SAFE_KEY=$(echo "$BASENAME" | tr -c 'A-Za-z0-9.-' '-')
+          echo "cache-key=$SAFE_KEY"
+          echo "cache-key=$SAFE_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: 缓存工厂镜像
+        id: cache-factory
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORK_DIR }}/factory.zip
+          # 严格按 build 标识匹配,不会跨 build 误命中
+          key: factory-${{ steps.factory-key.outputs.cache-key }}
+          # 不要 restore-keys 前缀 fallback — 不同 build 的 boot.img 不能混用
+
+      # ============================================================
       # 以原厂 stock .config 为基底
       # ============================================================
       - name: 以原厂 stock .config 为基底
         id: stockconfig
         env:
-          FACTORY_URL: ${{ inputs.stock_factory || secrets.CORAL_FACTORY_URL || 'https://dl.google.com/dl/android/aosp/coral-tp1a.220624.014-factory-8f60813e.zip' }}
+          # 兼容旧调用;真正生效的是顶层 env.FACTORY_URL
+          FACTORY_URL: ${{ env.FACTORY_URL }}
         run: |
+          set -euo pipefail
           cd "$WORK_DIR"
 
-          # 1. 下载工厂镜像
-          if [[ ! -f factory.zip ]]; then
+          # 1. 下载工厂镜像(不存在或 < 1MB 都视为无效,重下)
+          if [[ ! -s factory.zip ]] || [[ $(stat -c%s factory.zip 2>/dev/null || echo 0) -lt 1048576 ]]; then
+            rm -f factory.zip
             echo "下载工厂镜像: $FACTORY_URL"
-            curl -fLO --retry 3 --retry-delay 5 "$FACTORY_URL"
+            # --connect-timeout / --max-time 防止挂死
+            if ! curl -fL --retry 3 --retry-delay 5 \
+                 --connect-timeout 30 --max-time 1800 \
+                 -o factory.zip "$FACTORY_URL"; then
+              echo "::error::工厂镜像下载失败"
+              echo "FACTORY_URL=$FACTORY_URL"
+              echo "常见原因:"
+              echo "  - URL 拼错或 build ID 不属于本设备(例:coral 不能用 sargo 的 SP2A build)"
+              echo "  - 网络问题 / Google CDN 不可达"
+              echo "  - 文件大于 2GB,需保证 runner 磁盘充足"
+              exit 1
+            fi
           fi
+
+          # 2. 校验下载完整性
+          SZ=$(stat -c%s factory.zip)
+          echo "factory.zip: $(numfmt --to=iec --suffix=B $SZ)"
+          if [[ $SZ -lt 1048576 ]]; then
+            echo "::error::factory.zip 太小($SZ 字节),不像有效 factory 镜像"
+            file factory.zip || true
+            exit 1
+          fi
+
+          # 3. 解压
           mkdir -p factory_extracted
-          unzip -q -o factory.zip -d factory_extracted 2>/dev/null || true
-          ls -lh factory.zip
+          rm -rf factory_extracted/*
+          unzip -q -o factory.zip -d factory_extracted
+          echo "factory_extracted 内容:"
           ls factory_extracted/
 
           # 2. 找 stock boot.img
