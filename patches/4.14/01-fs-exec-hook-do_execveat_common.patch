@@ -1,0 +1,35 @@
+From: backslashxx/KernelSU contributors
+Subject: [PATCH 01/04] exec: hook do_execveat_common for sucompat (KSU)
+
+Insert ksu_handle_execveat() at the top of do_execveat_common().
+4.14 has had do_execveat_common since 3.19, and both sys_execve
+and compat sys_execve route through it. Hooking once covers all paths.
+
+Reference: backslashxx/KernelSU Issue #5 (v2.3, "3.19+ via do_execveat_common").
+---
+ fs/exec.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/fs/exec.c b/fs/exec.c
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1726,6 +1726,12 @@ static int do_execveat_common(int fd, struct filename *filename,
+ 			      struct user_arg_ptr argv,
+ 			      struct user_arg_ptr envp,
+ 			      int flags)
+ {
++	char *pathbuf = NULL;
++	struct linux_binprm *bprm;
++	struct file *file;
++	struct files_struct *displaced;
++	int retval;
+ 
++#ifdef CONFIG_KSU
++	extern int ksu_handle_execveat(int *, struct filename **, void *, void *, int *);
++	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
++#endif
+ 	if (IS_ERR(filename))
+ 		return PTR_ERR(filename);
+ 
+--
+2.34.1

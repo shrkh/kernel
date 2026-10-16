@@ -1,0 +1,35 @@
+From: backslashxx/KernelSU contributors
+Subject: [PATCH 02/04] open: hook sys_faccessat for sucompat (KSU, 4.14 and older)
+
+Insert ksu_handle_faccessat() at the top of sys_faccessat().
+The 4.14 (and older) signature of SYSCALL_DEFINE3(faccessat, ...) has
+override_cred handling inline (no do_faccessat wrapper), unlike 4.19+
+which calls do_faccessat(). So we must hook here, not in do_faccessat.
+
+Reference: backslashxx/KernelSU Issue #5 (v2.3, "4.14 and older").
+---
+ fs/open.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fs/open.c b/fs/open.c
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -...,6 +...,13 @@ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mo
+ {
+ 	const struct cred *old_cred;
+ 	struct cred *override_cred;
+ 	struct path path;
+ 	struct inode *inode;
+ 	int res;
+ 	unsigned int lookup_flags = LOOKUP_FOLLOW;
++
++#ifdef CONFIG_KSU
++	extern int ksu_handle_faccessat(int *, const char __user **, int *, int *);
++	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
++#endif
+ 
+ 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
+ 		return -EINVAL;
+ 
+--
+2.34.1

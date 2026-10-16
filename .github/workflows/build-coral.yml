@@ -44,12 +44,16 @@ on:
         default: 'https://github.com/msnx/KernelSU-Pixel4XL'
         type: string
       kernelsu_repo:
-        description: 'KernelSU (BakaSU) 仓库'
-        default: 'https://github.com/tiann/KernelSU'
+        description: 'KernelSU (BakaSU) 仓库 — 默认 backslashxx/KernelSU(覆盖 3.0~7.2,LKM/单源)'
+        default: 'https://github.com/backslashxx/KernelSU'
         type: string
       kernelsu_branch:
-        description: 'KernelSU 分支'
-        default: 'main'
+        description: 'KernelSU 分支 — backslashxx 用 master(不是 main!)'
+        default: 'master'
+        type: string
+      kernelsu_release_tag:
+        description: 'ksud prebuilt 下载哪个 release tag(留空用最新)'
+        default: ''
         type: string
       susfs_repo:
         description: 'SUSFS 仓库(默认 simonpunk/susfs4ksu on GitLab,kernel-4.14 分支)'
@@ -762,6 +766,161 @@ jobs:
           ls $WORK_DIR/new_boot_unpacked/
 
       # ============================================================
+      # 下载 BakaSU ksud prebuilt(从 kernelsu_repo 的 GitHub release)
+      # ============================================================
+      - name: 下载 BakaSU ksud prebuilt
+        id: ksud-dl
+        # ksud 是 BakaSU/KernelSU 的 userspace 守护进程,通常随 release 一起发布。
+        # 内核模块编进 zImage 后,运行时必须配套 ksud 才能 mount 模块、管理 su 权限。
+        # tag 留空就用最新 release(便于日常构建);正式发版可锁定具体 tag 复现。
+        timeout-minutes: 10
+        env:
+          KSU_REPO_URL: ${{ inputs.kernelsu_repo || secrets.BAKASU_REPO || 'https://github.com/backslashxx/KernelSU' }}
+          KSU_TAG: ${{ inputs.kernelsu_release_tag || '' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+
+          # 1. 从仓库 URL 解析 owner/repo(支持 .git 后缀、https:// 与 git@ 形式)
+          OWNER=$(printf '%s' "$KSU_REPO_URL" | sed -E 's#.*github\.com[:/]([^/]+)/([^/.]+)(\.git)?$#\1#')
+          REPO=$(printf '%s' "$KSU_REPO_URL"  | sed -E 's#.*github\.com[:/]([^/]+)/([^/.]+)(\.git)?$#\2#')
+          if [[ -z "$OWNER" || -z "$REPO" ]]; then
+            echo "::error::解析仓库 owner/repo 失败: $KSU_REPO_URL"
+            exit 1
+          fi
+          echo "仓库: $OWNER/$REPO"
+
+          # 2. 选 API:指定 tag 用 /releases/tags/<tag>,否则 /releases/latest
+          if [[ -n "$KSU_TAG" ]]; then
+            API_URL="https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/${KSU_TAG}"
+            echo "→ 指定 tag: $KSU_TAG"
+          else
+            API_URL="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
+            echo "→ 用最新 release"
+          fi
+
+          # 3. 调 API 拿 release JSON(带 token 提高 rate limit)
+          AUTH_ARGS=()
+          if [[ -n "$GITHUB_TOKEN" ]]; then
+            AUTH_ARGS=(-H "Authorization: token $GITHUB_TOKEN")
+          fi
+          echo "GET $API_URL"
+          RELEASE_JSON=$(curl -fsSL "${AUTH_ARGS[@]}" "$API_URL") || {
+            echo "::error::GitHub API 调用失败"
+            echo "  检查项:"
+            echo "    - repo 不存在或私有(无权访问):$OWNER/$REPO"
+            echo "    - tag 不存在: $KSU_TAG"
+            echo "    - GITHUB_TOKEN 缺失或失效"
+            exit 1
+          }
+          TAG_NAME=$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name // ""')
+          if [[ -z "$TAG_NAME" ]]; then
+            echo "::error::release JSON 没 tag_name,可能 API 返回了错误页面"
+            printf '%s' "$RELEASE_JSON" | head -20
+            exit 1
+          fi
+          echo "Release tag: $TAG_NAME"
+
+          # 4. 找 ksud 资产
+          #    优先级:1) 名字含 ksud 且含 android/arm64/aarch64;2) 仅含 ksud
+          #    用 jq 安全解析 JSON,避免 grep -oE 在多行字符串里出错
+          KSUD_ASSET=$(printf '%s' "$RELEASE_JSON" | jq -r '
+            [.assets[]?
+             | select((.name | test("ksud"; "i"))
+                     and (.name | test("android|arm64|aarch64"; "i")))]
+              + [.assets[]?
+                 | select(.name | test("ksud"; "i"))]
+            | .[0].browser_download_url // empty
+          ')
+          if [[ -z "$KSUD_ASSET" ]]; then
+            echo "::warning::Release $TAG_NAME 没找到 ksud 资产"
+            echo "  该 release 全部资产:"
+            printf '%s' "$RELEASE_JSON" | jq -r '.assets[]? | "    - \(.name) (\(.size) bytes)"'
+            echo "  → 跳过 ksud 打包,继续构建(AnyKernel3 不会含 ksud)"
+            echo "ksud-tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+            echo "ksud-asset=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ksud 资源: $KSUD_ASSET"
+
+          # 5. 下载(用 .bin 后缀,magic 让 file 命令能识别)
+          mkdir -p "$OUT_DIR"
+          KSUD_TMP="$WORK_DIR/ksud-release.bin"
+          curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 300 \
+            -o "$KSUD_TMP" "$KSUD_ASSET" || {
+            echo "::error::ksud 下载失败"
+            exit 1
+          }
+          echo "下载完成: $(ls -lh "$KSUD_TMP")"
+          file "$KSUD_TMP" || true
+
+          # 6. 判断是单文件还是压缩包
+          #    - zip:通常含 ksud + Manager.apk 的 release zip
+          #    - gzip/xz:tar 归档
+          #    - ELF:直接是二进制(罕见)
+          KSUD_FINAL="$OUT_DIR/ksud"
+          FTYPE=$(file -b "$KSUD_TMP" 2>/dev/null || echo unknown)
+          echo "文件类型: $FTYPE"
+
+          case "$FTYPE" in
+            *Zip*|*zip*)
+              mkdir -p ksud-extracted
+              if ! unzip -o -q "$KSUD_TMP" -d ksud-extracted; then
+                echo "::error::zip 解压失败"
+                exit 1
+              fi
+              # 优先找可执行文件 ksud,再退到 *ksud*
+              KSUD_BIN=$(find ksud-extracted -type f \( -name "ksud" -o -name "ksud-*" \) | head -1)
+              if [[ -z "$KSUD_BIN" ]]; then
+                echo "::warning::zip 里没 ksud 二进制"
+                find ksud-extracted -maxdepth 3 -type f | head -20
+                echo "  跳过"
+                exit 0
+              fi
+              cp "$KSUD_BIN" "$KSUD_FINAL"
+              ;;
+            *gzip*|*XZ*|*bzip2*)
+              mkdir -p ksud-extracted
+              tar -xf "$KSUD_TMP" -C ksud-extracted 2>/dev/null || {
+                echo "::error::归档解压失败"
+                exit 1
+              }
+              KSUD_BIN=$(find ksud-extracted -type f \( -name "ksud" -o -name "ksud-*" \) | head -1)
+              if [[ -z "$KSUD_BIN" ]]; then
+                echo "::warning::归档里没 ksud 二进制"
+                exit 0
+              fi
+              cp "$KSUD_BIN" "$KSUD_FINAL"
+              ;;
+            *ELF*|*executable*)
+              # 直接是二进制,改名即可
+              cp "$KSUD_TMP" "$KSUD_FINAL"
+              ;;
+            *)
+              echo "::warning::未知文件类型:$FTYPE,原样保存"
+              cp "$KSUD_TMP" "$KSUD_FINAL"
+              ;;
+          esac
+
+          chmod +x "$KSUD_FINAL"
+
+          echo "==== ksud 已就绪 ===="
+          ls -lh "$KSUD_FINAL"
+          file "$KSUD_FINAL" || true
+          sha256sum "$KSUD_FINAL" 2>/dev/null | head -c 16 && echo "..."
+
+          # 7. 顺手做基本健康检查(版本字符串 / 报错信息)
+          if "$KSUD_FINAL" --help 2>&1 | head -5; then
+            echo "  ✓ ksud 可执行"
+          else
+            echo "  ::warning::ksud 启动测试未通过(可能是 Android-only 链接库)"
+          fi
+
+          echo "ksud-tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "ksud-asset=$KSUD_ASSET" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
       # 制作 AnyKernel3 卡刷包
       # ============================================================
       - name: 制作 AnyKernel3 卡刷包
@@ -790,6 +949,36 @@ jobs:
           # 4. 复制 dtb(保留原厂 v2 DTB)
           if [[ -f "$WORK_DIR/stock_boot/boot.img-dtb" ]]; then
             cp "$WORK_DIR/stock_boot/boot.img-dtb" "$AK3_DIR/dtb" 2>/dev/null || true
+          fi
+
+          # 4.5 复制 ksud(BakaSU userspace 守护进程)
+          #      没有它,kernel 模块加载不了,刷进去内核启不来 su,所以临时用 KSUD
+          #      复制到 AK3_DIR/ksud/,AnyKernel3 会保留目录结构
+          if [[ -f "$OUT_DIR/ksud" ]]; then
+            mkdir -p "$AK3_DIR/ksud"
+            cp "$OUT_DIR/ksud" "$AK3_DIR/ksud/ksud"
+            chmod +x "$AK3_DIR/ksud/ksud"
+            echo "  ✓ ksud 已加入 AnyKernel3: $(ls -lh "$AK3_DIR/ksud/ksud" | awk '{print $5}')"
+            # 写个说明,免得用户不知道目录里是啥
+            cat > "$AK3_DIR/ksud/README.md" <<'EOF'
+          # ksud — BakaSU/KernelSU userspace daemon
+
+          这是与内核模块配套的用户态守护进程。
+
+          ## 安装(必须)
+          ```sh
+          adb push ksud /data/local/tmp/
+          adb shell su -c "mkdir -p /data/adb/ksud"
+          adb shell su -c "cp /data/local/tmp/ksud /data/adb/ksud/ksud"
+          adb shell su -c "chmod 755 /data/adb/ksud/ksud"
+          adb shell su -c "/data/adb/ksud/ksud --help"   # 验证
+          ```
+
+          ## 升级(以后 OTA)
+          直接覆盖 `/data/adb/ksud/ksud` 即可,kernel 模块和 daemon 版本要匹配。
+          EOF
+          else
+            echo "  ⊘ 未提供 ksud,AnyKernel3 不含(检查 kernelsu_release_tag 输入)"
           fi
 
           # 5. 清理 .git
@@ -868,6 +1057,7 @@ jobs:
           KSU_HEAD: ${{ steps.bakasu.outputs.kernelsu-head }}
           SUSFS_HEAD: ${{ steps.susfs.outputs.susfs-head }}
           CORAL_HEAD: ${{ steps.bakasu.outputs.coral-head }}
+          KSUD_TAG: ${{ steps.ksud-dl.outputs.ksud-tag }}
         run: |
           printf '%s\n' \
             '## Pixel 4XL (coral) 内核构建' \
@@ -880,15 +1070,17 @@ jobs:
             "- **coral kernel**: \`${CORAL_HEAD}\`" \
             "- **KernelSU/BakaSU**: \`${KSU_HEAD}\`" \
             "- **SUSFS**: \`${SUSFS_HEAD}\`" \
+            "- **ksud**: ${KSUD_TAG:-N/A}" \
             "- **Linux kernel**: $(cat $KERNEL_DIR/include/config/kernel.release 2>/dev/null || echo N/A)" \
             '' \
             '### 产物' \
             '- `new-boot.img` — boot 镜像,保留原厂 v2 DTB' \
-            '- `AnyKernel3-coral-*.zip` — TWRP 卡刷包' \
+            '- `AnyKernel3-coral-*.zip` — TWRP 卡刷包(内置 ksud)' \
             '' \
             '### 刷机方法' \
             '1. TWRP recovery → Install → 选 zip' \
             '2. 或 fastboot: `fastboot flash boot new-boot.img`' \
+            '3. 首次启动后手动部署 ksud: `adb push ksud /data/local/tmp && adb shell su -c "cp /data/local/tmp/ksud /data/adb/ksud/ksud && chmod 755 /data/adb/ksud/ksud"`' \
             > "$WORK_DIR/release_notes.md"
 
           cat "$WORK_DIR/release_notes.md"

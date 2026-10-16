@@ -1,0 +1,34 @@
+From: backslashxx/KernelSU contributors
+Subject: [PATCH 04/04] reboot: hook sys_reboot for supercall (KSU, 3.18+)
+
+Insert ksu_handle_sys_reboot() at the top of sys_reboot().
+Needed for KernelSU supercall (introduced at v12143). 3.18+ variant
+matches 4.14 (sys_reboot lives in kernel/reboot.c with this signature).
+
+Guard with `#ifndef CONFIG_KSU_KPROBES_KSUD` so we don't double-hook when
+kprobes are available.
+
+Reference: backslashxx/KernelSU Issue #5 (v2.3, "3.18+").
+---
+ kernel/reboot.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/kernel/reboot.c b/kernel/reboot.c
+--- a/kernel/reboot.c
++++ b/kernel/reboot.c
+@@ -282,6 +282,12 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+ 		void __user *, arg)
+ {
+ 	struct pid_namespace *pid_ns = task_active_pid_ns(current);
+ 	char buffer[256];
+ 	int ret = 0;
++
++#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_KPROBES_KSUD)
++	extern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);
++	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
++#endif
+ 
+ 	/* We only trust the superuser with rebooting the system. */
+ 	if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))
+--
+2.34.1

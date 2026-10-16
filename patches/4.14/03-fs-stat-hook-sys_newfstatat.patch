@@ -1,0 +1,42 @@
+From: backslashxx/KernelSU contributors
+Subject: [PATCH 03/04] stat: hook sys_newfstatat and sys_fstatat64 for sucompat (KSU)
+
+Insert ksu_handle_stat() at the top of sys_newfstatat() and sys_fstatat64().
+Needed for sucompat path resolution; works on 4.14 and newer kernels.
+
+Reference: backslashxx/KernelSU Issue #5 (v2.3).
+---
+ fs/stat.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/fs/stat.c b/fs/stat.c
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -369,6 +369,12 @@ SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+ 		struct stat __user *, statbuf, int, flag)
+ {
+ 	struct kstat stat;
+ 	int error;
++
++#ifdef CONFIG_KSU
++	extern int ksu_handle_stat(int *, const char __user **, int *);
++	ksu_handle_stat(&dfd, &filename, &flag);
++#endif
+ 
+ 	error = vfs_fstatat(dfd, filename, &stat, flag);
+ 	if (error)
+@@ -513,6 +519,13 @@ SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,
+ 		struct stat64 __user *, statbuf, int, flag)
+ {
+ 	struct kstat stat;
+ 	int error;
++
++#ifdef CONFIG_KSU	/* for 32-bit */
++	extern int ksu_handle_stat(int *, const char __user **, int *);
++	ksu_handle_stat(&dfd, &filename, &flag);
++#endif
+ 
+ 	error = vfs_fstatat(dfd, filename, &stat, flag);
+ 	if (error)
+--
+2.34.1
