@@ -131,7 +131,7 @@ brew install --cask android-platform-tools
 
 # 拆 vendor 模块(从工厂 ZIP)
 python3 scripts/extract_vendor.py \
-    ~/Downloads/coral-sp2a.220505.008-factory-*.zip \
+    ~/Downloads/coral-tp1a.220624.014-factory-*.zip \
     vendor_modules/
 
 # 编译
@@ -161,7 +161,7 @@ fastboot fetch backups/coral_boot_$(date +%Y%m%d).img boot
 
 > 也可以从官方 factory 镜像直接提取原版 boot.img:
 > ```bash
-> unzip coral-sp2a.220505.008-factory-*.zip -d factory/
+> unzip coral-tp1a.220624.014-factory-*.zip -d factory/
 > cp factory/*/boot.img backups/stock_boot.img
 > ```
 
@@ -309,8 +309,8 @@ adb shell getprop ro.boot.dtbo
 # https://developers.google.com/android/images#coral
 
 # 2. 解压
-unzip coral-sp2a.220505.008-factory-*.zip -d factory/
-cd factory/coral-sp2a.220505.008/
+unzip coral-tp1a.220624.014-factory-*.zip -d factory/
+cd factory/coral-tp1a.220624.014/
 
 # 3. 重新刷 boot.img(以及 vendor_dlkm,如果之前也改过)
 ./flash-all.sh    # macOS/Linux

@@ -102,7 +102,7 @@ git push origin v0.1.0
 
 # 3. 拆 vendor_dlkm(如果用了 GKI 模式)
 python3 scripts/extract_vendor.py \
-    ~/Downloads/coral-sp2a.220505.008-factory-*.zip \
+    ~/Downloads/coral-tp1a.220624.014-factory-*.zip \
     vendor_modules/
 
 # 4. 编译内核(默认 ~25 分钟,ccache 命中后 ~5 分钟)

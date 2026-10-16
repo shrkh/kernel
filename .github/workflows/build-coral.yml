@@ -65,7 +65,7 @@ on:
         type: string
       stock_factory:
         description: 'Pixel 4XL 工厂镜像 URL'
-        default: 'https://dl.google.com/dl/android/aosp/coral-sp2a.220505.008-factory-b1d35049.zip'
+        default: 'https://dl.google.com/dl/android/aosp/coral-tp1a.220624.014-factory-8f60813e.zip'
         type: string
 
 # 写权限仅给 release(后续 tag release 会用)
@@ -326,7 +326,7 @@ jobs:
       - name: 以原厂 stock .config 为基底
         id: stockconfig
         env:
-          FACTORY_URL: ${{ inputs.stock_factory || secrets.CORAL_FACTORY_URL || 'https://dl.google.com/dl/android/aosp/coral-sp2a.220505.008-factory-b1d35049.zip' }}
+          FACTORY_URL: ${{ inputs.stock_factory || secrets.CORAL_FACTORY_URL || 'https://dl.google.com/dl/android/aosp/coral-tp1a.220624.014-factory-8f60813e.zip' }}
         run: |
           cd "$WORK_DIR"
 

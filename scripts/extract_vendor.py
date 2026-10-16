@@ -16,7 +16,7 @@ extract_vendor.py — 从 Pixel 4XL (coral) 工厂镜像提取 Qualcomm vendor �
 
 用法:
     # 1. 从工厂 ZIP 拆
-    python3 scripts/extract_vendor.py coral-sp2a.220505.008-factory-xxx.zip out/
+    python3 scripts/extract_vendor.py coral-tp1a.220624.014-factory-xxx.zip out/
 
     # 2. 已经解压的目录(含 vendor_dlkm.img)
     python3 scripts/extract_vendor.py ./factory_extracted/ out/
@@ -373,7 +373,7 @@ def resolve_factory_input(input_path: Path, work_dir: Path) -> tuple[Path, Optio
     if input_path.is_dir():
         # 先找 vendor_dlkm.img
         for cand in [input_path / "vendor_dlkm.img",
-                     input_path / "image-coral-sp2a*" / "vendor_dlkm.img"]:
+                     input_path / "image-coral-*" / "vendor_dlkm.img"]:
             for p in input_path.glob(str(cand.relative_to(input_path))):
                 if p.is_file():
                     return p, input_path
