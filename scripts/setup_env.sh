@@ -167,10 +167,13 @@ do_install() {
     sudo apt-get update
     sudo apt-get install -y "${unique_pkgs[@]}"
 
-    log "simg2img 不在 apt,正在下载..."
-    sudo curl -fsSL https://github.com/anestisb/android-simg2img/releases/download/v1.1.0/simg2img \
-        -o /usr/local/bin/simg2img
-    sudo chmod +x /usr/local/bin/simg2img
+    log "simg2img 不在 apt,正在 git clone + make ..."
+    sudo rm -f /usr/local/bin/simg2img
+    sudo git clone --depth=1 --branch 1.1.5 \
+        https://github.com/anestisb/android-simg2img /opt/simg2img
+    sudo make -C /opt/simg2img
+    sudo install -m 0755 /opt/simg2img/simg2img /usr/local/bin/simg2img
+    sudo rm -rf /opt/simg2img
 
     ok "安装完成,请重新运行 $0 验证"
 }
@@ -192,9 +195,11 @@ do_fix() {
             echo "    sudo apt install -y build-essential bc bison ccache flex \\"
             echo "      libssl-dev libelf-dev dwarves rsync cpio unzip xz-utils curl \\"
             echo "      e2fsprogs python3 python2 android-tools-adb android-tools-fastboot"
-            echo "    # simg2img 从 GitHub 下载 prebuilt"
-            echo "    sudo curl -L https://github.com/anestisb/android-simg2img/releases/download/v1.1.0/simg2img \\"
-            echo "      -o /usr/local/bin/simg2img && sudo chmod +x /usr/local/bin/simg2img"
+            echo "    # simg2img upstream 没 release,从源码 make(prebuilt URL 已 404)"
+            echo "    sudo git clone --depth=1 --branch 1.1.5 \\"
+            echo "      https://github.com/anestisb/android-simg2img /opt/simg2img"
+            echo "    sudo make -C /opt/simg2img"
+            echo "    sudo install -m 0755 /opt/simg2img/simg2img /usr/local/bin/simg2img"
             ;;
         macos)
             echo "  macOS:"

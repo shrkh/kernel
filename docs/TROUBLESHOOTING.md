@@ -111,18 +111,19 @@ make ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- defconfig
 
 ### Q1: `simg2img: not found`
 
-脚本会自动从 GitHub 下载,但如果下载失败:
+脚本会自动 `git clone --branch 1.1.5` 源码并 `make`,但如果 `git` / `gcc` / `make`
+缺失会失败。可手动编译:
 
 ```bash
-# 手动下载
-mkdir -p vendor_modules/.work
-curl -L https://github.com/anestisb/android-simg2img/releases/download/v1.1.0/simg2img \
-    -o vendor_modules/.work/simg2img
-chmod +x vendor_modules/.work/simg2img
-
-# 或全局安装
-sudo cp vendor_modules/.work/simg2img /usr/local/bin/
+# 手动编译(从源码,避免 upstream prebuilt URL 404)
+git clone --depth=1 --branch 1.1.5 https://github.com/anestisb/android-simg2img /tmp/simg2img
+make -C /tmp/simg2img
+sudo install -m 0755 /tmp/simg2img/simg2img /usr/local/bin/
 ```
+
+> 历史提示: 之前用的是
+> `https://github.com/anestisb/android-simg2img/releases/download/v1.1.0/simg2img`
+> 这个 URL,因为 upstream 从未发布 GitHub Release,会返回 404。已统一切到 git tag 源码编译。
 
 ### Q2: `debugfs: 没有那个文件或目录`
 

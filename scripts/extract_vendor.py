@@ -60,9 +60,12 @@ GZIP_MAGIC = b"\x1f\x8b"
 EXT_MAGIC_OFFSET = 0x438
 EXT_MAGIC = b"\x53\xef"
 
-SIMG2IMG_URL = (
-    "https://github.com/anestisb/android-simg2img/releases/download/v1.1.0/simg2img"
-)
+# upstream 从未发布 prebuilt 二进制(/releases/download/* 全部 404),
+# 改用 git clone + make。需要 git / make / gcc,这些都是 kernel build 的前置依赖。
+SIMG2IMG_REPO = "https://github.com/anestisb/android-simg2img"
+SIMG2IMG_REF = "1.1.5"   # 最新 git tag
+# 文档提示用,失败时给用户看
+SIMG2IMG_SOURCE_URL = f"{SIMG2IMG_REPO}/tree/{SIMG2IMG_REF}"
 
 
 # ---------- 数据结构 ----------
@@ -120,24 +123,53 @@ def which_or_die(tool: str, install_hint: str = "") -> str:
 
 
 def ensure_simg2img(install_dir: Path) -> str:
-    """确保 simg2img 可用,没有就下载"""
+    """确保 simg2img 可用,没有就从 upstream 源码编译(只需一次)"""
     local = install_dir / "simg2img"
     if local.exists() and os.access(local, os.X_OK):
         return str(local)
 
-    # 系统 PATH 里也有?
+    # 系统 PATH 里已有(用户自己装过),直接复用
     sys_path = shutil.which("simg2img")
     if sys_path:
         return sys_path
 
-    log(f"simg2img 不在 PATH,正在从 GitHub 下载到 {local} ...")
+    # 系统 PATH 里没有 -> 源码编译。注意 git/make/gcc 是 kernel build 的
+    # 前置依赖,本脚本本身也只在这种环境里跑。
+    log(f"simg2img 不在 PATH,正在 git clone + make to {local} ...")
     install_dir.mkdir(parents=True, exist_ok=True)
+    src_dir = install_dir / "_simg2img_src"
+
+    if shutil.which("git") is None:
+        die(
+            "找不到 git,无法拉取 simg2img 源码\n"
+            f"  请手动编译 {SIMG2IMG_SOURCE_URL} 后把 simg2img 放到 PATH"
+        )
+
+    import subprocess
+    # 用 --depth=1 + --branch 限制拉取量,只取最少的源码
+    subprocess.run(
+        ["git", "clone", "--depth=1", "--branch", SIMG2IMG_REF, SIMG2IMG_REPO, str(src_dir)],
+        check=True,
+    )
     try:
-        import urllib.request
-        urllib.request.urlretrieve(SIMG2IMG_URL, local)
+        # Makefile 一般是 POS Makefile,要 gmake;Linux 上 make 即可
+        make_bin = shutil.which("gmake") or shutil.which("make")
+        if make_bin is None:
+            die("找不到 make/gmake,无法编译 simg2img\n"
+                "  Linux:  apt install build-essential\n"
+                "  macOS:  xcode-select --install")
+        subprocess.run([make_bin], cwd=str(src_dir), check=True)
+        # 把编译产物拷出来
+        shutil.copy2(str(src_dir / "simg2img"), str(local))
         local.chmod(0o755)
-    except Exception as e:
-        die(f"下载 simg2img 失败: {e}\n  请手动下载 {SIMG2IMG_URL} 并放到 PATH")
+    except subprocess.CalledProcessError as e:
+        die(
+            f"编译 simg2img 失败: {e}\n"
+            f"  请手动编译 {SIMG2IMG_SOURCE_URL} 后把可执行文件放到 PATH"
+        )
+    finally:
+        # 不论成败都清掉源码目录,保留 ~10KB 二进制
+        shutil.rmtree(str(src_dir), ignore_errors=True)
     return str(local)
 
 
