@@ -1,6 +1,6 @@
 # KernelSU + SUSFS 集成说明
 
-本项目工作流 (`build-coral.yml`) 默认集成 **BakaSU** (KernelSU 的 fork) 和 **SUSFS v2.3.0**,编译出带 root 隐藏功能的内核。
+本项目工作流 (`build-coral.yml`) 默认集成 **BakaSU** (KernelSU 的 fork) 和 **SUSFS** (simonpunk/susfs4ksu 的 `kernel-4.14` 分支,内含 SUSFS v1.5.5),编译出带 root 隐藏功能的内核。
 
 > ⚠️ **警告**:root 内核**违反 Android 安全模型**,可能导致:
 > - 银行类 app 检测到 root 后拒绝运行(SafetyNet/Play Integrity fail)
@@ -49,7 +49,7 @@ git apply KernelSU/kernel/*.patch
 
 ## 什么是 SUSFS?
 
-[SUSFS](https://github.com/sidex15/susfs) = **SU** (SuperUser) **S**ecure **F**ile **S**ystem,由 sidex15 开发。
+[SUSFS](https://gitlab.com/simonpunk/susfs4ksu) = **SU** (SuperUser) **S**ecure **F**ile **S**ystem,由 simonpunk 开发,sidex15 等社区维护非 GKI fork。
 
 KernelSU 给了 root 权限,但 root 痕迹会被检测:
 - `/proc/mounts` 暴露挂载点
@@ -72,27 +72,33 @@ SUSFS 通过**内核级 hook**伪装这些痕迹。
 
 ### 非 GKI inline hooks
 
-非 GKI 内核(像 5.10 Pixel 内核)没法用 GKI 的 `EXPORT_SYMBOL` 接口做 module hook。
+非 GKI 内核(像 4.14 Pixel 内核)没法用 GKI 的 `EXPORT_SYMBOL` 接口做 module hook。
 
-SUSFS 提供 inline hooks(直接修改内核函数),绕过 GKI 限制。这是 v2.3.0 最大的改进。
+SUSFS 提供 inline hooks(直接修改内核函数),绕过 GKI 限制。这是 v1.5.x 系列起持续在做的事。
 
 ### 集成方式
 
 ```bash
-# 1. clone SUSFS
-git clone --depth=1 https://github.com/sidex15/susfs
-# 或特定版本
-git clone --depth=1 --branch v2.3.0 https://github.com/sidex15/susfs
+# 1. clone SUSFS(注意:upstream 是 GitLab,不是 GitHub)
+#    Pixel 4 XL 用 kernel-4.14 分支(对应 v1.5.5)
+git clone --depth=1 --branch kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git
+#    其他设备如需 v2.x(GKI 5.10+),用 master / gki-android12-5.10 等
 
 # 2. 应用 patch(由 SUSFS 提供,针对特定内核版本)
 git apply susfs/kernel_patches/*.patch
+#    注意:50_add_susfs_in_kernel-4.14.patch 是给 4.14 内核专用的
 
 # 3. 复制 SUSFS 源码到内核
-cp -r susfs/kernel_patches/fs/susfs fs/
+cp -rv susfs/kernel_patches/fs/susfs fs/
+cp -rv susfs/kernel_patches/include/linux/* include/linux/
 
 # 4. 开启 Kconfig
-./scripts/config --file .config --enable SUSFS
+./scripts/config --file .config --enable KSU_SUSFS
 ```
+
+> **重要**:SUSFS 的"版本"(v1.5.5 / v2.3.0)是 patch 内部的字符串,不是 git tag/branch。
+> upstream 只按**内核树**分分支(kernel-4.14 / gki-android12-5.10 / ...)。
+> 想升 SUSFS,先看 upstream 哪个分支还在维护,然后切到那个分支。
 
 ---
 
@@ -100,10 +106,10 @@ cp -r susfs/kernel_patches/fs/susfs fs/
 
 ### 内核版本
 - 源码: [`msnx/KernelSU-Pixel4XL`](https://github.com/msnx/KernelSU-Pixel4XL) `main` 分支
-- 内核基础: **Linux 5.10.123+**(`android-msm-coral-4.14-android13` legacy 树)
+- 内核基础: **Linux 4.14.276**(`android-msm-coral-4.14-android13` legacy 树)
 - 设备代号: `floral`(Pixel 4 / 4 XL 共用)
-- KernelSU 0.7.x+ 支持 5.10
-- SUSFS v2.3.0 适配 5.10
+- KernelSU 0.7.x+ 支持 4.14
+- SUSFS **v1.5.5**(从 `kernel-4.14` 分支)
 
 > **历史**:`android13-d1-release` 是 AOSP `kernel/manifest` 上的 repo manifest 分支名
 > (用 `repo init -u .../kernel/manifest -b android13-d1-release` 拉整棵 manifest),
@@ -114,12 +120,13 @@ cp -r susfs/kernel_patches/fs/susfs fs/
 
 | 模式 | 说明 | Pixel 4XL |
 |------|------|-----------|
-| **GKI** | Google 通用内核镜像 + vendor 装载 | 部分支持(只支持 bootloader 后的 vendor_dlkm) |
-| **非 GKI** | 内核直接编译设备特定代码 | Pixel 4XL 默认走这个 |
+| **GKI** | Google 通用内核镜像 + vendor 装载 | 不支持(4.14 太老,不是 GKI) |
+| **非 GKI** | 内核直接编译设备特定代码 | Pixel 4XL 走这个 |
 
-Pixel 4XL 在 5.10+ 介于两者之间:有 GKI 接口,但 dtbo/display 部分走 vendor 路径。
+Pixel 4XL 在 4.14 是纯非 GKI:所有 hook 都在内核源码里做,无 `EXPORT_SYMBOL` for modules 路径。
 
-**SUSFS v2.3.0 的 inline hooks** 主要解决这个过渡期的 hook 缺失问题。
+**SUSFS 的 inline hooks**(配合 `#if defined(CONFIG_KPROBES) && 0` 关闭 KSU 自带 kprobe)是这个
+唯一可行的非 GKI 集成方式。
 
 ---
 
@@ -139,13 +146,21 @@ kernelsu_branch: my-feature
 - `BAKASU_REPO`: `https://github.com/<yourname>/BakaSU`
 - `BAKASU_BRANCH`: `main`
 
-### 用特定 SUSFS 版本
+### 用特定 SUSFS 分支/版本
 
-工作流默认 v2.3.0。要改版本,在 `.github/workflows/build-coral.yml` 里改:
+SUSFS upstream (`simonpunk/susfs4ksu`) 按**内核树**分分支,**没有版本 tag**。
+想换分支,在 workflow input `susfs_branch` 或 secret `SUSFS_BRANCH` 里指定:
+
+- `kernel-4.14` — Pixel 4 / 4 XL(默认,v1.5.5)
+- `kernel-4.19` — Pixel 4a (5G) / Pixel 5
+- `kernel-5.4` — OnePlus 8 系列
+- `gki-android12-5.10` / `gki-android13-5.10` / ... — GKI 内核(5.10+)
+
+或在 `.github/workflows/build-coral.yml` 里改默认:
 
 ```yaml
 env:
-  SUSFS_VERSION: '2.3.0'  # 改成你想要的版本
+  SUSFS_VERSION: '1.5.5'  # 仅用作日志/显示;真正生效的是 susfs_branch
 ```
 
 ### 用自定义 AnyKernel3 模板
@@ -244,7 +259,7 @@ ls $KERNEL_DIR/fs/susfs/
 ## 资源链接
 
 - [KernelSU 官方文档](https://kernelsu.org/)
-- [SUSFS README](https://github.com/sidex15/susfs)
+- [SUSFS upstream](https://gitlab.com/simonpunk/susfs4ksu)
 - [BakaSU 原仓库](https://github.com/yourname/KernelSU)(占位,请用真实仓库)
 - [Play Integrity Fix](https://github.com/chiteroman/PlayIntegrityFix)
 - [MagiskHide 替代:Shamiko](https://github.com/LSPosed/LSPosed.github.io/releases)

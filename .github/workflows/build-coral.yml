@@ -1,5 +1,5 @@
 # GitHub Actions: Build Pixel 4XL (coral) Android 13 内核
-# 含 BakaSU (KernelSU fork) + SUSFS v2.3.0 + AnyKernel3 卡刷包打包
+# 含 BakaSU (KernelSU fork) + SUSFS (simonpunk/susfs4ksu kernel-4.14, v1.5.5) + AnyKernel3 卡刷包打包
 #
 # 触发:
 #   - pull_request:  构建 + 上传 artifact
@@ -52,8 +52,12 @@ on:
         default: 'main'
         type: string
       susfs_repo:
-        description: 'SUSFS 仓库'
-        default: 'https://github.com/sidex15/susfs'
+        description: 'SUSFS 仓库(默认 simonpunk/susfs4ksu on GitLab,kernel-4.14 分支)'
+        default: 'https://gitlab.com/simonpunk/susfs4ksu.git'
+        type: string
+      susfs_branch:
+        description: 'SUSFS 分支(Pixel 4 XL 用 kernel-4.14,v1.5.5)'
+        default: 'kernel-4.14'
         type: string
       anykernel3_repo:
         description: 'AnyKernel3 模板仓库(留空用 osm0sis/AnyKernel3)'
@@ -82,7 +86,11 @@ env:
 
   # 工具链版本
   CLANG_VERSION: '11.0.1'
-  SUSFS_VERSION: '2.3.0'
+  # SUSFS 版本只用作日志/显示;susfs4ksu upstream 是按 kernel 树分分支的,
+  # 真正的"版本"在 $KERNEL_DIR/fs/susfs.c 的 pr_info 里,不是 tag/branch 名。
+  # Pixel 4 XL (kernel 4.14) 用 simonpunk/susfs4ksu 的 `kernel-4.14` 分支,
+  # 对应 SUSFS v1.5.5(v2.x 是 GKI 5.10+ 的,4.14 用不了)。
+  SUSFS_VERSION: '1.5.5'
 
   # ccache
   CCACHE_MAXSIZE: '30G'
@@ -226,22 +234,28 @@ jobs:
           echo "coral-head=$CORAL_HEAD" >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 集成 SUSFS v2.3.0 + 非 GKI inline hooks
+      # 集成 SUSFS 内核补丁 + 非 GKI inline hooks
       # ============================================================
       - name: 集成 SUSFS v${{ env.SUSFS_VERSION }} 内核补丁 + 非 GKI inline hooks
         id: susfs
         env:
-          SUSFS_REPO: ${{ inputs.susfs_repo || secrets.SUSFS_REPO || 'https://github.com/sidex15/susfs' }}
+          SUSFS_REPO: ${{ inputs.susfs_repo || secrets.SUSFS_REPO || 'https://gitlab.com/simonpunk/susfs4ksu.git' }}
+          # Pixel 4 XL 内核是 4.14 non-GKI,必须用 simonpunk/susfs4ksu 的 kernel-4.14 分支
+          # (master/gki-* 系列是 5.10+/GKI,跟 4.14 不兼容)
+          SUSFS_BRANCH: ${{ inputs.susfs_branch || secrets.SUSFS_BRANCH || 'kernel-4.14' }}
         run: |
           cd "$WORK_DIR"
 
-          # 1. clone SUSFS(尝试指定 tag/tag 失败就 clone 默认分支)
-          echo "Clone SUSFS: $SUSFS_REPO @ v${SUSFS_VERSION}"
-          if ! git clone --depth=1 --branch "v${SUSFS_VERSION}" "$SUSFS_REPO" susfs 2>/dev/null; then
-            git clone --depth=1 --branch "${SUSFS_VERSION}" "$SUSFS_REPO" susfs 2>/dev/null || \
-              git clone --depth=1 "$SUSFS_REPO" susfs
-          fi
+          # 1. clone SUSFS
+          #    注意:upstream 没有 v1.5.5 / v2.3.0 这种"版本 tag",只按内核树分分支。
+          #    这里的 SUSFS_VERSION 仅用于日志显示,实际取哪个分支由 SUSFS_BRANCH 决定。
+          echo "Clone SUSFS: $SUSFS_REPO @ $SUSFS_BRANCH (kernel patches version v${SUSFS_VERSION})"
+          git clone --depth=1 --branch "$SUSFS_BRANCH" "$SUSFS_REPO" susfs
           SUSFS_HEAD=$(git -C susfs rev-parse --short HEAD)
+          echo "SUSFS HEAD: $SUSFS_HEAD"
+          # 真实版本号(从 patches 源里 grep 出来,而不是 env 变量)
+          grep -hE '^#define SUSFS_VERSION' "$WORK_DIR/susfs"/kernel_patches/include/linux/susfs.h 2>/dev/null | head -1 || true
+          # kernel-4.14 头里没定义 SUSFS_VERSION(它在 Kconfig 里),不强求 grep 结果
           echo "SUSFS HEAD: $SUSFS_HEAD"
 
           # 2. 应用 SUSFS patches

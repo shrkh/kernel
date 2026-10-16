@@ -5,7 +5,7 @@
 项目特性:
 
 - ✅ **公开可用** — 完全基于 AOSP 公开仓库 + 工厂镜像,不依赖任何私有 device tree
-- 🔐 **BakaSU + SUSFS 集成** — 工作流自动集成 KernelSU fork + SUSFS v2.3.0(可选)
+- 🔐 **BakaSU + SUSFS 集成** — 工作流自动集成 KernelSU fork + SUSFS(`simonpunk/susfs4ksu` `kernel-4.14` 分支,v1.5.5)
 - 📦 **AnyKernel3 卡刷包** — 编译完直接打包成 TWRP 卡刷包
 - ⚡ **CI/CD** — GitHub Actions 单 job 完整 pipeline,PR 自动产生可下载的 boot.img
 - 🔌 **vendor 模块自动拆解** — 从工厂镜像 `vendor_dlkm.img` 拆出 Qualcomm 内核模块
@@ -60,7 +60,8 @@ Settings → Secrets and variables → Actions → 添加:
 | `CORAL_FACTORY_URL` | Pixel 4XL 工厂镜像 URL | 公开 stock URL |
 | `BAKASU_REPO` | 自定义 BakaSU fork 仓库 | `https://github.com/tiann/KernelSU` |
 | `BAKASU_BRANCH` | BakaSU 分支 | `main` |
-| `SUSFS_REPO` | SUSFS 仓库 | `https://github.com/sidex15/susfs` |
+| `SUSFS_REPO` | SUSFS 仓库(GitLab) | `https://gitlab.com/simonpunk/susfs4ksu.git` |
+| `SUSFS_BRANCH` | SUSFS 分支(按内核树选) | `kernel-4.14` |
 | `ANYKERNEL3_REPO` | 自定义 AnyKernel3 模板 | `https://github.com/osm0sis/AnyKernel3` |
 
 **3. 触发构建**
@@ -163,7 +164,7 @@ vendor_modules/
 下载 clang 11.0.1 工具链 (LLVM 官方 release)
 ↓
 集成 BakaSU (KernelSU 分支, 内置 su)
-集成 SUSFS v2.3.0 内核补丁 + 非 GKI inline hooks
+集成 SUSFS 内核补丁 + 非 GKI inline hooks
 ↓
 设置 ccache 缓存
 清理 out 输出目录
@@ -241,7 +242,7 @@ tag 触发时:创建 GitHub Release(自动)
 - Google AOSP 团队的内核 build.sh 通用脚本
 - [LLVM](https://llvm.org/) 提供 clang 11.0.1
 - [KernelSU](https://github.com/tiann/KernelSU) 团队
-- [sidex15/susfs](https://github.com/sidex15/susfs) 提供 v2.3.0 集成
+- [simonpunk/susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu) 提供 v1.5.5 集成
 - [osm0sis/AnyKernel3](https://github.com/osm0sis/AnyKernel3) 卡刷包模板
 - [anestisb/android-simg2img](https://github.com/anestisb/android-simg2img) 提供 prebuilt `simg2img`
 - [nickel-jn/kernel_coral](https://github.com/nickel-jn/kernel_coral) 等社区 fork 提供思路
