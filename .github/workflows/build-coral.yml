@@ -336,8 +336,8 @@ jobs:
             # — 仅在没有 build.sh / build/build.sh 时才走,否则 build.sh 会因为缺私有 module 挂
             # 引号 heredoc 防 ${} 被 YAML 解析(虽然 run: | 应该没问题,但双保险)
             cat > build.config <<'EOF_MINIMAL'
-            DEFCONFIG=__DEFCONFIG__
-            EOF_MINIMAL
+DEFCONFIG=__DEFCONFIG__
+EOF_MINIMAL
             sed -i "s|__DEFCONFIG__|${DEFCONFIG_NAME}|" build.config
             echo "::warning::没找到 build.config.* 也没 wrapper,写了一个 minimal:DEFCONFIG=${DEFCONFIG_NAME}"
             echo "  这通常意味着 kernel_repo 不完整(缺少 private/msm-google 私有模块)"
