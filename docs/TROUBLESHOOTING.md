@@ -97,18 +97,52 @@ git log --oneline | head -5
 # 3. 重新基于当前 commit 生成 patch
 ```
 
-### Q7: `aarch64-linux-android-gcc: command not found`
+### Q8: `KernelSU/kernel_patches/ 找不到 4.14 对应的 patch`
 
-build.sh 应该会自动下载,但如果失败:
-
-```bash
-# 手动安装
-cd kernel/google-coral
-./build/build.sh --download-prebuilts
-
-# 或
-make ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- defconfig
+**症状**(GitHub Actions):
 ```
+Error: KernelSU/kernel_patches/ 找不到 4.14 对应的 patch
+  排查清单:
+    1. 你指定的 kernelsu_repo(默认 backslashxx/KernelSU)是否包含 4.14 的 patch?
+    ...
+    - 或 kernel_repo 改用 msnx/KernelSU-Pixel4XL(默认就是这个)
+Error: Process completed with exit code 1.
+```
+
+**背景**:
+- 官方 tiann/KernelSU 从 v0.6.0 起只支持 GKI(5.10+),不再维护 4.14
+- 社区有几个 4.14 fork:
+  - `begmans/ksu-pixel4xl` — Pixel 4 专用,**已预集成** KernelSU 4.14 sources
+  - `tiann/KernelSU @ v0.5.2` — 最后一个官方 4.14 tag(但 patch 可能不完整)
+  - `msnx/KernelSU-Pixel4XL` — 默认内核源,但也是公开 fork,需要自己集成 patch
+
+**解决**(优先级):
+
+**方案 A (推荐,无需 patch)**:
+```yaml
+# GitHub Actions 手动运行:
+kernel_repo = https://github.com/begmans/ksu-pixel4xl
+kernel_branch = main
+# 这个源已预集成 KernelSU drivers/kernelsu/,无需 patch
+```
+
+**方案 B (用旧版本官方源)**:
+```yaml
+kernelsu_repo = https://github.com/tiann/KernelSU
+kernelsu_branch = v0.5.2
+# 这个 tag 应含 kernel_patches/4.14/(但不保证完整)
+```
+
+**方案 C (本地调试)**:
+```bash
+# 若自建 KernelSU fork,确保 kernel_patches/4.14/ 目录存在且有 patch
+cd $KernelSU_REPO_LOCAL
+find kernel_patches -name "*.patch" | grep -i 4.14 | wc -l
+# 应该 > 0
+```
+
+> **工作流自动回退**: workflow 已配置,若检测到 4.14 + backslashxx 源无 patch,
+> 会自动回退到 begmans/ksu-pixel4xl。如果仍失败,说明网络或 GitHub API 有问题。
 
 ---
 

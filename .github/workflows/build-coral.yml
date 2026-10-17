@@ -12,19 +12,18 @@
 #   - AnyKernel3-coral-<timestamp>.zip    TWRP 卡刷包
 #
 # 关键设计:
-#   - 单 job(Sequential),因为所有步骤都在同一个 runner 上跑效率最高
-#   - clang 11.0.1 直接从 LLVM 官方 GitHub release 下载
-#   - ccache 用 actions/cache@v4 跨 run 复用
-#   - 错误步骤详细日志输出,便于诊断问题
-#   - 4.14 kernel 自动选择合适的 KernelSU 源(begmans/ksu-pixel4xl)
+#   - 单 job(Sequential),所有步骤都在同一个 runner 上跑效率最高
+#   - 设备特定参数(coral kernel 源、SUSFS 源、factory 镜像)全部硬编码到 env
+#     块,workflow_dispatch 只暴露 3 个真正需要灵活配置的输入(KSU fork/branch/tag)
+#   - 默认 KSU = begmans/ksu-pixel4xl @ main(4.14 专用,已预集成,免 patch)
+#   - clang 11.0.1 从 LLVM 官方 GitHub release 下载
+#   - ccache 用 actions/cache@v4 跨 run 复用(留 1 核 jobs 避免 OOM)
+#   - 错误步骤详细日志输出,便于诊断
 #
-# 故障排查(KernelSU 4.14 patch 缺失错误):
-#   1. 如果看到 "KernelSU/kernel_patches/ 找不到 4.14 对应的 patch"
-#   2. GitHub Actions 手动运行 workflow:
-#      - kernelsu_repo = https://github.com/begmans/ksu-pixel4xl
-#      - kernelsu_branch = main
-#   3. 或改用 kernel_repo = https://github.com/begmans/ksu-pixel4xl
-#      (该源已预集成 KernelSU,无需 patch)
+# 故障排查(KernelSU 集成失败):
+#   - drivers/kernelsu/ 缺失或内核 patch 未应用:确认 KSU 源是 4.14 兼容版本
+#   - 想用其他 KSU fork(测试新功能):在 workflow_dispatch 输入中指定
+#     kernelsu_repo=https://github.com/<user>/<fork>,branch=<branch>
 
 name: Build coral kernel (GKI + BakaSU + SUSFS)
 
@@ -41,44 +40,20 @@ on:
     branches: [main]
     tags: ['v*.*.*']
   workflow_dispatch:
+    # 只暴露真正需要灵活配置的输入。其他对 Pixel 4XL 都是硬性要求,
+    # 已统一硬编码到下面的 env 块,不可改。
     inputs:
-      kernel_branch:
-        description: 'coral 内核分支(msnx/KernelSU-Pixel4XL 只提供 main)'
-        default: 'main'
-        type: choice
-        options:
-          - main
-      kernel_repo:
-        description: 'coral 内核仓库 URL(默认 msnx/KernelSU-Pixel4XL,已预集成 KSU)'
-        default: 'https://github.com/msnx/KernelSU-Pixel4XL'
-        type: string
       kernelsu_repo:
-        description: '(可选)KernelSU/BakaSU 仓库 — 留空自动选择(4.14→begmans, 5.10+→backslashxx)'
+        description: 'KernelSU/BakaSU 仓库(留空用 begmans/ksu-pixel4xl @ main;5.10+ 可填 backslashxx/KernelSU)'
         default: ''
         type: string
       kernelsu_branch:
-        description: '(可选)KernelSU 分支 — 留空自动选择(4.14→main, 5.10+→master)'
+        description: 'KernelSU 分支(留空用 main)'
         default: ''
         type: string
       kernelsu_release_tag:
         description: 'ksud prebuilt 下载哪个 release tag(留空用最新)'
         default: ''
-        type: string
-      susfs_repo:
-        description: 'SUSFS 仓库(默认 simonpunk/susfs4ksu on GitLab,kernel-4.14 分支)'
-        default: 'https://gitlab.com/simonpunk/susfs4ksu.git'
-        type: string
-      susfs_branch:
-        description: 'SUSFS 分支(Pixel 4 XL 用 kernel-4.14,v1.5.5)'
-        default: 'kernel-4.14'
-        type: string
-      anykernel3_repo:
-        description: 'AnyKernel3 模板仓库(留空用 osm0sis/AnyKernel3)'
-        default: ''
-        type: string
-      stock_factory:
-        description: 'Pixel 4XL 工厂镜像 URL'
-        default: 'https://dl.google.com/dl/android/aosp/coral-tp1a.220624.014-factory-8f60813e.zip'
         type: string
 
 # 写权限仅给 release(后续 tag release 会用)
@@ -101,18 +76,33 @@ env:
   CLANG_VERSION: '11.0.1'
   # SUSFS 版本只用作日志/显示;susfs4ksu upstream 是按 kernel 树分分支的,
   # 真正的"版本"在 $KERNEL_DIR/fs/susfs.c 的 pr_info 里,不是 tag/branch 名。
-
-  # 工厂镜像(在多个 step 共享:stockconfig 下载、cache key)
-  FACTORY_URL: ${{ inputs.stock_factory || secrets.CORAL_FACTORY_URL || 'https://dl.google.com/dl/android/aosp/coral-tp1a.220624.014-factory-8f60813e.zip' }}
-
-  # 磁盘预检:factory 2.2GB + 解压 ~4GB + ccache 30GB ≈ 36GB,留 6GB 缓冲
-  MIN_FREE_GB: '6'
   # Pixel 4 XL (kernel 4.14) 用 simonpunk/susfs4ksu 的 `kernel-4.14` 分支,
   # 对应 SUSFS v1.5.5(v2.x 是 GKI 5.10+ 的,4.14 用不了)。
   SUSFS_VERSION: '1.5.5'
 
+  # 磁盘预检:factory 2.2GB + 解压 ~4GB + ccache 30GB ≈ 36GB,留 6GB 缓冲
+  MIN_FREE_GB: '6'
+
   # ccache
   CCACHE_MAXSIZE: '30G'
+
+  # ========== 硬编码:coral 设备特定参数(非用户可配) ==========
+  # Pixel 4 / 4 XL 4.14 内核唯一可用源(已预集成 KSU,无需 patch)
+  # 上游 AOSP android.googlesource.com/kernel/google/coral/ 不存在(404);
+  # 官方遗留分支 device/google/coral-kernel 是 device tree 而非 kernel 树。
+  CORAL_KERNEL_REPO: 'https://github.com/msnx/KernelSU-Pixel4XL'
+  CORAL_KERNEL_BRANCH: 'main'
+
+  # SUSFS 4.14 唯一可用源(其他分支是 5.10+ GKI)
+  SUSFS_REPO: 'https://gitlab.com/simonpunk/susfs4ksu.git'
+  SUSFS_BRANCH: 'kernel-4.14'
+
+  # AnyKernel3 模板(留空 = 用 osm0sis/AnyKernel3)
+  ANYKERNEL3_REPO: ''
+
+  # 工厂镜像 URL(从 secrets 覆盖,留空用 Pixel 4 XL Android 13 官方 build)
+  # 注:这里不能引用 env 块内其他变量(GitHub Actions 限制),URL 必须内联
+  FACTORY_URL: ${{ secrets.CORAL_FACTORY_URL || 'https://dl.google.com/dl/android/aosp/coral-tp1a.220624.014-factory-8f60813e.zip' }}
 
 jobs:
   build:
@@ -213,13 +203,13 @@ jobs:
         # 30 分钟对两个大仓库的 clone 来说宽裕;超时就停,避免挂死
         timeout-minutes: 30
         env:
-          KSU_REPO: ${{ inputs.kernelsu_repo || secrets.BAKASU_REPO || 'https://github.com/tiann/KernelSU' }}
+          # 默认用 begmans/ksu-pixel4xl @ main(coral 4.14 专用,已预集成 KSU,免 patch)
+          # 用户可在 workflow_dispatch 输入里覆盖
+          KSU_REPO: ${{ inputs.kernelsu_repo || secrets.BAKASU_REPO || 'https://github.com/begmans/ksu-pixel4xl' }}
           KSU_BRANCH: ${{ inputs.kernelsu_branch || secrets.BAKASU_BRANCH || 'main' }}
-          KERNEL_BRANCH: ${{ inputs.kernel_branch || 'main' }}
-          # coral 内核在 community 仓库 msnx/KernelSU-Pixel4XL (Pixel 4 / 4 XL 共用 "floral" 内核)。
-          # 上游 AOSP `android.googlesource.com/kernel/google/coral/` 不存在(404);
-          # 官方遗留分支是 `device/google/coral-kernel` 而非 kernel 树,无法直接 git clone。
-          KERNEL_REPO: ${{ inputs.kernel_repo || secrets.CORAL_KERNEL_REPO || 'https://github.com/msnx/KernelSU-Pixel4XL' }}
+          KERNEL_BRANCH: ${{ env.CORAL_KERNEL_BRANCH }}
+          # coral 内核在 community 仓库 msnx/KernelSU-Pixel4XL(已预集成 KSU,无需 patch)
+          KERNEL_REPO: ${{ secrets.CORAL_KERNEL_REPO || env.CORAL_KERNEL_REPO }}
           # 网络调优:挂死检测 + 不稳定连接退避
           GIT_HTTP_LOW_SPEED_LIMIT: '1000'  # 1KB/s 持续 N 秒算挂
           GIT_HTTP_LOW_SPEED_TIME: '60'
@@ -228,29 +218,12 @@ jobs:
           set -euo pipefail
           cd "$WORK_DIR"
 
-          # ===== KernelSU/BakaSU 源自动选择逻辑 =====
-          # 策略:如果用户未指定 repo/branch,根据内核版本智能选择:
-          #   - 4.14: 用 begmans/ksu-pixel4xl @ main (4.14 专用,已预集成)
-          #   - 4.19: 用 tiann/KernelSU @ v0.5.2
-          #   - 5.x+: 用 backslashxx/KernelSU @ master
-          # 用户显式指定的 repo/branch 保持不变
-          
-          # 先从 coral 内核读版本(估算,不必精确)
-          CORAL_KERNEL_VER=$(git -C "$KERNEL_DIR" log --oneline -1 2>/dev/null | head -c 40 || echo "unknown")
-          echo "coral kernel HEAD: $CORAL_KERNEL_VER"
-          
-          # 用现有 Makefile 探测(若已 clone)
-          if [[ -f "$KERNEL_DIR/Makefile" ]]; then
-            KRN_MAJOR_PROBE=$(grep -E '^PATCHLEVEL\s*=' "$KERNEL_DIR/Makefile" | head -1 | tr -d ' ' | cut -d= -f2 || echo "")
-            if [[ "$KRN_MAJOR_PROBE" == "14" ]]; then
-              # 4.14 kernel: 用 begmans/ksu-pixel4xl(已预集成)
-              if [[ -z "$KSU_REPO" ]] || [[ "$KSU_REPO" == "https://github.com/backslashxx/KernelSU" ]]; then
-                echo "✓ 检测到 4.14 kernel,自动选择 begmans/ksu-pixel4xl"
-                KSU_REPO="https://github.com/begmans/ksu-pixel4xl"
-                KSU_BRANCH="main"
-              fi
-            fi
-          fi
+          # KSU 源选择:
+          #   - 默认(bakasu step env 里的 KSU_REPO) = begmans/ksu-pixel4xl @ main
+          #     (4.14 专用,已预集成 KSU,免 patch)
+          #   - 用户通过 inputs.kernelsu_repo 覆盖(测试其他 fork/版本)
+          #   - 4.19/5.10+ 等场景下用户需自行指定 backslashxx 或 tiann
+          # 注:已固定 coral=4.14,无需运行时再探测内核版本
 
           # 幂等 clone:已存在且 HEAD 匹配就跳过,避免被取消后重跑全量重下
           smart_clone() {
@@ -505,7 +478,7 @@ jobs:
             
             # 显示 KernelSU 仓库结构,便于诊断
             echo "KernelSU 仓库结构:"
-            find "$WORK_DIR/KernelSU" -maxdepth 3 -type d -name "kernel_patches" -o -path "*/kernel_patches/*" 2>/dev/null | head -20 || true
+            find "$WORK_DIR/KernelSU" -maxdepth 3 \( -type d -name "kernel_patches" -o -path "*/kernel_patches/*" \) 2>/dev/null | head -20 || true
             
             if [[ -d "$PATCH_BASE/${KRN_MAJOR}" ]]; then
               mapfile -t PATCH_FILES < <(find "$PATCH_BASE/${KRN_MAJOR}" -maxdepth 1 -name "*.patch" | sort)
@@ -781,10 +754,8 @@ jobs:
         id: susfs
         timeout-minutes: 20
         env:
-          SUSFS_REPO: ${{ inputs.susfs_repo || secrets.SUSFS_REPO || 'https://gitlab.com/simonpunk/susfs4ksu.git' }}
-          # Pixel 4 XL 内核是 4.14 non-GKI,必须用 simonpunk/susfs4ksu 的 kernel-4.14 分支
-          # (master/gki-* 系列是 5.10+/GKI,跟 4.14 不兼容)
-          SUSFS_BRANCH: ${{ inputs.susfs_branch || secrets.SUSFS_BRANCH || 'kernel-4.14' }}
+          SUSFS_REPO: ${{ secrets.SUSFS_REPO || env.SUSFS_REPO }}
+          SUSFS_BRANCH: ${{ secrets.SUSFS_BRANCH || env.SUSFS_BRANCH }}
           GIT_HTTP_LOW_SPEED_LIMIT: '1000'
           GIT_HTTP_LOW_SPEED_TIME: '60'
         run: |
@@ -899,20 +870,37 @@ jobs:
           fi
 
           # 3. 复制 SUSFS 源码(fs/susfs/ 等)
+          #    注意:用 `src/." 这种"目录+/. "形式复制目录内容(而非嵌套目录),
+          #    避免 $KERNEL_DIR/ 出现 kernel_patches/fs/ 这种错误嵌套
+          SUSFS_COPIED=0
           for src_dir in kernel_patches/fs kernel_patches/include kernel_patches/fs/susfs; do
             src="$WORK_DIR/susfs/$src_dir"
             if [[ -d "$src" ]]; then
-              cp -rv "$src" "$KERNEL_DIR/" 2>/dev/null || true
+              if cp -rn "$src/." "$KERNEL_DIR/" 2>/dev/null; then
+                echo "  ✓ 复制: $src/. → $KERNEL_DIR/"
+                SUSFS_COPIED=1
+              else
+                echo "  ::warning::复制 $src 失败"
+              fi
             fi
           done
           # fallback: 找任何含 susfs 字样的目录
           mapfile -t SRC_DIRS < <(find "$WORK_DIR/susfs" -type d -name "*susfs*" 2>/dev/null)
           for d in "${SRC_DIRS[@]}"; do
-            if [[ "$d" == *"/kernel"* ]]; then
-              cp -rv "$d"/* "$KERNEL_DIR/" 2>/dev/null || true
-              echo "复制: $d"
+            # 排除 susfs 仓库自身的"kernel_patches"等通用目录,只复制实际含源码的子目录
+            if [[ "$d" == *"/kernel"* ]] && [[ "$d" != *"/kernel_patches"* ]]; then
+              if cp -rn "$d/." "$KERNEL_DIR/" 2>/dev/null; then
+                echo "  ✓ 复制: $d → $KERNEL_DIR/"
+                SUSFS_COPIED=1
+              fi
             fi
           done
+
+          if [[ $SUSFS_COPIED -eq 0 ]]; then
+            echo "::warning::SUSFS 没复制任何额外源码(可能 patch 已集成或路径不匹配)"
+            echo "  检查 $KERNEL_DIR/fs/ 下 susfs 相关文件:"
+            ls "$KERNEL_DIR/fs/" 2>/dev/null | grep -i susfs || echo "  (无 susfs 文件)"
+          fi
 
           echo "susfs-head=$SUSFS_HEAD" >> "$GITHUB_OUTPUT"
 
@@ -1072,9 +1060,9 @@ jobs:
                 echo "  L3 尝试: strings 提取 IKCFG_ST 标记"
                 # IKCFG_ST 是内核嵌入 .config 的魔数(8字节,值为 0x01020304)
                 # 紧跟其后是 gzip 压缩的 .config
-                TMP_BIN=$(mktemp)
-                if strings "$WORK_DIR/stock_boot/boot.img-zImage" | grep -aob "IKCFG_ST" | head -1 | cut -d: -f1 > /tmp/ikcfg_off; then
-                  OFF=$(cat /tmp/ikcfg_off 2>/dev/null || echo 0)
+                IKCFG_OFF_FILE=$(mktemp)
+                if strings "$WORK_DIR/stock_boot/boot.img-zImage" | grep -aob "IKCFG_ST" | head -1 | cut -d: -f1 > "$IKCFG_OFF_FILE"; then
+                  OFF=$(cat "$IKCFG_OFF_FILE" 2>/dev/null || echo 0)
                   if [[ "$OFF" -gt 0 ]]; then
                     # 跳过 8 字节标记,取之后所有数据
                     tail -c +$((OFF + 9)) "$WORK_DIR/stock_boot/boot.img-zImage" | \
@@ -1090,7 +1078,7 @@ jobs:
                     echo "  L3 ✗ 未找到 IKCFG_ST 标记"
                   fi
                 fi
-                rm -f "$TMP_BIN"
+                rm -f "$IKCFG_OFF_FILE"
               fi
 
               if $EXTRACT_OK; then
@@ -1238,15 +1226,18 @@ jobs:
             echo "→ 用 build/build.sh + BUILD_CONFIG=$BUILD_CONFIG"
             ./build/build.sh > "$BUILD_LOG_FIFO" 2>&1
           else
-            echo "→ 没有 build.sh,直接 make"
+            # 留 1 核余量,避免 4.14 全编时 OOM killer 触发
+            MAKE_JOBS=$(($(nproc) - 1))
+            [[ $MAKE_JOBS -lt 2 ]] && MAKE_JOBS=2
+            echo "→ 没有 build.sh,直接 make (jobs=$MAKE_JOBS)"
             make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                  CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-                 O=out -j"$(nproc)" \
+                 O=out -j"$MAKE_JOBS" \
                  ${DEFCONFIG_NAME:-floral_defconfig} olddefconfig \
                  > "$BUILD_LOG_FIFO" 2>&1
             make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                  CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-                 O=out -j"$(nproc)" \
+                 O=out -j"$MAKE_JOBS" \
                  Image.gz-dtb dtbo.img modules >> "$BUILD_LOG_FIFO" 2>&1
           fi
           BUILD_RC=$?
@@ -1588,8 +1579,7 @@ jobs:
           ls -lh "$KSUD_FINAL"
           file "$KSUD_FINAL" || true
           KSUD_SHA=$(sha256sum "$KSUD_FINAL" | awk '{print $1}')
-          KSUD_SHA_SHORT="${KSUD_SHA:0:16}"
-          echo "ksud SHA256: ${KSUD_SHA}..."
+          echo "ksud SHA256: ${KSUD_SHA}"
           # 持久化到 OUT_DIR 用于 build-info 调试
           echo "$KSUD_SHA  ksud" > "$OUT_DIR/ksud.sha256"
 
@@ -1608,7 +1598,7 @@ jobs:
       # ============================================================
       - name: 制作 AnyKernel3 卡刷包
         env:
-          AK3_REPO: ${{ inputs.anykernel3_repo || secrets.ANYKERNEL3_REPO || '' }}
+          AK3_REPO: ${{ secrets.ANYKERNEL3_REPO || env.ANYKERNEL3_REPO }}
         run: |
           AK3_DIR="$WORK_DIR/AnyKernel3"
 
