@@ -142,22 +142,36 @@ jobs:
           df -h $WORK_DIR
 
       # ============================================================
-      # 磁盘预检 — factory 2.2GB + 解压 ~4GB + 编译产物 + ccache
+      # 磁盘预检 — factory 2.5GB + 解压 4GB + ccache 30GB + 编译临时 5GB ≈ 41.5GB
+      # 之前:仅检查 $WORK_DIR 总可用,未分项。改进:显式分项阈值 + 留缓冲
       # ============================================================
       - name: 磁盘空间预检
         run: |
           FREE_KB=$(df --output=avail "$WORK_DIR" | tail -1 | tr -d ' ')
           FREE_GB=$((FREE_KB / 1024 / 1024))
           echo "WORK_DIR 剩余空间: ${FREE_GB}GB"
-          NEED="$MIN_FREE_GB"
-          if [[ "$FREE_GB" -lt "$NEED" ]]; then
-            echo "::error::磁盘空间不足,需要至少 ${NEED}GB,实际剩余 ${FREE_GB}GB"
+
+          # 显式分项预估(MB)
+          NEED_FACTORY_MB=2500
+          NEED_EXTRACT_MB=4000
+          NEED_CCACHE_MB=$(( ${CCACHE_MAXSIZE%G} * 1024 ))   # 30G -> 30720
+          NEED_COMPILE_MB=5000
+          NEED_TOTAL_MB=$((NEED_FACTORY_MB + NEED_EXTRACT_MB + NEED_CCACHE_MB + NEED_COMPILE_MB))
+          NEED_TOTAL_GB=$((NEED_TOTAL_MB / 1024))
+          echo "分项需求: factory=${NEED_FACTORY_MB}MB + extract=${NEED_EXTRACT_MB}MB + ccache=${NEED_CCACHE_MB}MB + compile=${NEED_COMPILE_MB}MB = ${NEED_TOTAL_GB}GB"
+
+          # 简单判定用 MIN_FREE_GB 即可;若 MIN_FREE_GB < 精算,加警告
+          if [[ "$FREE_GB" -lt "$MIN_FREE_GB" ]]; then
+            echo "::error::磁盘空间不足,需要至少 ${MIN_FREE_GB}GB,实际剩余 ${FREE_GB}GB"
             echo "已用空间明细:"
             du -sh "$WORK_DIR" "$CCACHE_DIR" "$OUT_DIR" 2>/dev/null | sort -h || true
-            echo "提示:可在 ccache 限速 (CCACHE_MAXSIZE) 或加 -Xmx 给 gradle 上限"
             exit 1
           fi
-          echo "磁盘预检通过:剩余 ${FREE_GB}GB >= ${NEED}GB"
+          if [[ "$FREE_GB" -lt "$NEED_TOTAL_GB" ]]; then
+            echo "::warning::剩余 ${FREE_GB}GB 低于精算需求 ${NEED_TOTAL_GB}GB,可能编译中途 OOM"
+            echo "  建议:减小 CCACHE_MAXSIZE 或用更大 runner"
+          fi
+          echo "磁盘预检通过:剩余 ${FREE_GB}GB >= ${MIN_FREE_GB}GB"
 
       # ============================================================
       # 下载 clang 11.0.1 (LLVM 官方 release)
@@ -334,11 +348,9 @@ jobs:
           if [[ -z "$BUILD_CONFIG_REL" ]]; then
             # 兜底:写一个 minimal build.config(用 floral_defconfig)
             # — 仅在没有 build.sh / build/build.sh 时才走,否则 build.sh 会因为缺私有 module 挂
-            # 引号 heredoc 防 ${} 被 YAML 解析(虽然 run: | 应该没问题,但双保险)
-            cat > build.config <<'EOF_MINIMAL'
-DEFCONFIG=__DEFCONFIG__
-EOF_MINIMAL
-            sed -i "s|__DEFCONFIG__|${DEFCONFIG_NAME}|" build.config
+            # 注意:YAML literal block scalar 要求 heredoc 内容保持缩进且终止符紧贴 left margin
+            # 此处用 echo 直接写文件避免 heredoc 解析歧义
+            echo "DEFCONFIG=${DEFCONFIG_NAME}" > build.config
             echo "::warning::没找到 build.config.* 也没 wrapper,写了一个 minimal:DEFCONFIG=${DEFCONFIG_NAME}"
             echo "  这通常意味着 kernel_repo 不完整(缺少 private/msm-google 私有模块)"
             echo "  建议改用完整 AOSP manifest:kernel_repo 保持默认,改用 repo 工具初始化"
@@ -521,35 +533,71 @@ EOF_MINIMAL
             fi
 
             # 4.3 应用 patch
+            #    改进:不再容忍"⚠ 跳过" — 任一关键 patch 失败即中止构建
+            #    原因:跳过 patch 会导致 KSU 部分功能缺失,运行时静默失败
+            #    经验上 4.14 系列 patch 应 100% 应用;3-way 解决少数上下文偏移
             #    fallback 可能让我们在 $WORK_DIR,这里强制回到 $KERNEL_DIR
             cd "$KERNEL_DIR"
-            echo "应用 ${#PATCH_FILES[@]} 个 patch:"
+            echo "应用 ${#PATCH_FILES[@]} 个 patch(全部必须成功):"
             APPLIED=0
             FAILED=0
+            FAILED_LIST=()
             for p in "${PATCH_FILES[@]}"; do
               rel="${p#$PATCH_BASE/}"
+              bn=$(basename "$p")
               if git apply --check "$p" 2>/dev/null; then
-                if git apply "$p"; then
+                if git apply "$p" 2>&1; then
                   echo "  ✓ $rel"
                   APPLIED=$((APPLIED + 1))
                 else
                   echo "  ✗ $rel (apply 失败)"
                   FAILED=$((FAILED + 1))
+                  FAILED_LIST+=("$bn")
                 fi
               elif git apply --3way "$p" 2>/dev/null; then
                 echo "  ✓ $rel (3-way)"
                 APPLIED=$((APPLIED + 1))
               else
-                echo "  ⚠ $rel (冲突,跳过)"
+                echo "  ✗ $rel (冲突,无法应用)"
                 FAILED=$((FAILED + 1))
+                FAILED_LIST+=("$bn")
               fi
             done
-            echo "  应用结果: $APPLIED 成功 / $FAILED 跳过"
+            echo "  应用结果: $APPLIED 成功 / $FAILED 失败"
 
+            # 4.3.1 关键 patch 必须全部应用
+            #       重要:exec/open/stat/reboot 四个 hook 是 KSU 核心,缺一不可
+            CRITICAL_HOOKS=("01-fs-exec-hook" "02-fs-open-hook" "03-fs-stat-hook" "04-kernel-reboot-hook")
+            MISSING_HOOKS=()
+            for hook in "${CRITICAL_HOOKS[@]}"; do
+              # 检查内核源码里是否已含 hook 标记(grep hook 函数名)
+              case "$hook" in
+                *exec*)    marker="ksu_handle_execveat"  ;;
+                *open*)    marker="ksu_handle_faccessat" ;;
+                *stat*)    marker="ksu_handle_newfstatat" ;;
+                *reboot*)  marker="ksu_handle_reboot"     ;;
+              esac
+              if ! grep -rq "$marker" "$KERNEL_DIR/fs" "$KERNEL_DIR/kernel" 2>/dev/null; then
+                MISSING_HOOKS+=("$hook (marker: $marker)")
+              fi
+            done
+            if [[ ${#MISSING_HOOKS[@]} -gt 0 ]]; then
+              echo "::error::KernelSU 关键 hook 未应用,集成失败:"
+              for h in "${MISSING_HOOKS[@]}"; do
+                echo "  - 缺失: $h"
+              done
+              echo "  失败的 patch:"
+              for f in "${FAILED_LIST[@]}"; do
+                echo "  - $f"
+              done
+              echo "  解法:检查 KSU 版本是否匹配 4.14;或回退到 tiann/KernelSU @ v0.5.2"
+              exit 1
+            fi
             if [[ $APPLIED -eq 0 ]]; then
               echo "::error::没有成功应用任何 patch,集成失败"
               exit 1
             fi
+            echo "✓ 4 个关键 hook 全部就位(exec/open/stat/reboot)"
 
             # 4.4 复制 kernel/ 源码到 drivers/kernelsu/
             #     patch 应该已创建该目录;如果没,手动创建
@@ -663,20 +711,75 @@ EOF_MINIMAL
           echo "SUSFS HEAD: $SUSFS_HEAD"
 
           # 2. 应用 SUSFS patches
+          #    改进:不再用 "|| echo skip" 静默吞错,而是显式分类:
+          #      - OK:正常 apply
+          #      - 3-way:上下文偏移但能合并
+          #      - skip:已应用过(说明之前跑过,幂等)
+          #      - 失败:冲突且无法合并 → 中止
+          #    SUSFS 对内核的修改是关键路径(susfs.c + susfs.h),缺一不可
           mapfile -t SUSFS_PATCHES < <(find "$WORK_DIR/susfs" -name "*.patch" -type f 2>/dev/null | sort)
-          if [[ ${#SUSFS_PATCHES[@]} -gt 0 ]]; then
-            echo "应用 ${#SUSFS_PATCHES[@]} 个 SUSFS patch ..."
+          if [[ ${#SUSFS_PATCHES[@]} -eq 0 ]]; then
+            echo "::warning::SUSFS 仓库里没 *.patch 文件,可能仓库结构有变"
+            echo "  检查 $WORK_DIR/susfs 内容:"
+            ls -la "$WORK_DIR/susfs" 2>/dev/null || true
+          else
+            echo "应用 ${#SUSFS_PATCHES[@]} 个 SUSFS patch(关键路径,失败即中止):"
             (
               cd "$KERNEL_DIR"
+              SUSFS_APPLIED=0
+              SUSFS_SKIP=0
+              SUSFS_FAIL=0
+              SUSFS_FAIL_LIST=()
               for p in "${SUSFS_PATCHES[@]}"; do
-                echo "  Apply: $(basename "$p")"
-                if git apply --check "$p" 2>/dev/null; then
-                  git apply "$p" && echo "    OK"
+                bn=$(basename "$p")
+                # 1) check:已应用?→ skip(幂等)
+                if git apply --check --reverse "$p" 2>/dev/null; then
+                  echo "  ⊘ $bn (已应用,跳过)"
+                  SUSFS_SKIP=$((SUSFS_SKIP + 1))
+                # 2) check:可正常 apply?→ apply
+                elif git apply --check "$p" 2>/dev/null; then
+                  if git apply "$p" 2>&1; then
+                    echo "  ✓ $bn"
+                    SUSFS_APPLIED=$((SUSFS_APPLIED + 1))
+                  else
+                    echo "  ✗ $bn (check OK 但 apply 失败)"
+                    SUSFS_FAIL=$((SUSFS_FAIL + 1))
+                    SUSFS_FAIL_LIST+=("$bn")
+                  fi
+                # 3) 3-way merge:有冲突但能合并
+                elif git apply --3way "$p" 2>/dev/null; then
+                  echo "  ✓ $bn (3-way)"
+                  SUSFS_APPLIED=$((SUSFS_APPLIED + 1))
+                # 4) 完全失败
                 else
-                  git apply --3way "$p" 2>/dev/null && echo "    3-way OK" || \
-                    echo "    skip"
+                  echo "  ✗ $bn (冲突且无法合并)"
+                  SUSFS_FAIL=$((SUSFS_FAIL + 1))
+                  SUSFS_FAIL_LIST+=("$bn")
                 fi
               done
+              echo "  结果: $SUSFS_APPLIED 新应用 / $SUSFS_SKIP 幂等跳过 / $SUSFS_FAIL 失败"
+
+              # 验证 SUSFS 源码是否就位 — fs/susfs.c 必须存在
+              if [[ ! -f "$KERNEL_DIR/fs/susfs.c" ]] && \
+                 [[ ! -f "$KERNEL_DIR/fs/susfs/susfs.c" ]] && \
+                 ! find "$KERNEL_DIR" -maxdepth 3 -name "susfs.c" 2>/dev/null | grep -q .; then
+                echo "::error::SUSFS 源码未就位(susfs.c 缺失),patch 集成失败"
+                echo "  失败的 patch:"
+                for f in "${SUSFS_FAIL_LIST[@]}"; do
+                  echo "  - $f"
+                done
+                exit 1
+              fi
+              if [[ $SUSFS_FAIL -gt 0 ]]; then
+                echo "::error::$SUSFS_FAIL 个 SUSFS patch 失败,中止构建"
+                echo "  失败的 patch:"
+                for f in "${SUSFS_FAIL_LIST[@]}"; do
+                  echo "  - $f"
+                done
+                echo "  解法:确认 SUSFS_BRANCH 与内核版本匹配(4.14 → kernel-4.14 分支)"
+                exit 1
+              fi
+              echo "✓ SUSFS 源码就位 + 关键 patch 全部应用"
             )
           fi
 
@@ -813,18 +916,83 @@ EOF_MINIMAL
           ./unpackbootimg -i "$WORK_DIR/stock-boot.img" -o .
           ls
 
-          # 4. 提取 stock 内核的 .config(通过 extract-ikconfig 脚本)
+          # 4. 提取 stock 内核的 .config
+          #    改进:之前只尝试 scripts/extract-ikconfig,且失败就静默用 defconfig。
+          #    现在分 4 级 fallback,每级失败时输出可诊断信息,最后兜底 defconfig:
+          #      L1: scripts/extract-ikconfig(标准方法,绝大多数 AOSP 内核支持)
+          #      L2: scripts/extract-gas(较老内核的压缩 .config 提取方式)
+          #      L3: binwalk / strings 提取 IKCFG_ST 标记
+          #      L4: defconfig(最差,可能有配置偏差)
           if [[ -f boot.img-zImage ]]; then
             (
               cd "$KERNEL_DIR"
+              EXTRACT_OK=false
+
+              # L1: extract-ikconfig
               if [[ -x scripts/extract-ikconfig ]]; then
-                scripts/extract-ikconfig "$WORK_DIR/stock_boot/boot.img-zImage" > stock_ikconfig.txt
+                if scripts/extract-ikconfig "$WORK_DIR/stock_boot/boot.img-zImage" > stock_ikconfig.txt 2>/dev/null \
+                   && [[ -s stock_ikconfig.txt ]] && [[ $(wc -l < stock_ikconfig.txt) -gt 100 ]]; then
+                  echo "L1 ✓ scripts/extract-ikconfig: $(wc -l < stock_ikconfig.txt) 行"
+                  EXTRACT_OK=true
+                else
+                  echo "  L1 ✗ scripts/extract-ikconfig 输出为空或过短"
+                fi
+              else
+                echo "  L1 ✗ scripts/extract-ikconfig 不存在"
+              fi
+
+              # L2: extract-gas(legacy gzip 压缩)
+              if ! $EXTRACT_OK && [[ -x scripts/extract-gas ]]; then
+                if scripts/extract-gas stock_ikconfig.txt "$WORK_DIR/stock_boot/boot.img-zImage" 2>/dev/null \
+                   && [[ -s stock_ikconfig.txt ]]; then
+                  echo "L2 ✓ scripts/extract-gas: $(wc -l < stock_ikconfig.txt) 行"
+                  EXTRACT_OK=true
+                else
+                  echo "  L2 ✗ scripts/extract-gas 失败"
+                fi
+              fi
+
+              # L3: 用 strings + IKCFG_ST 标记手动提取
+              if ! $EXTRACT_OK; then
+                echo "  L3 尝试: strings 提取 IKCFG_ST 标记"
+                # IKCFG_ST 是内核嵌入 .config 的魔数(8字节,值为 0x01020304)
+                # 紧跟其后是 gzip 压缩的 .config
+                TMP_BIN=$(mktemp)
+                if strings "$WORK_DIR/stock_boot/boot.img-zImage" | grep -aob "IKCFG_ST" | head -1 | cut -d: -f1 > /tmp/ikcfg_off; then
+                  OFF=$(cat /tmp/ikcfg_off 2>/dev/null || echo 0)
+                  if [[ "$OFF" -gt 0 ]]; then
+                    # 跳过 8 字节标记,取之后所有数据
+                    tail -c +$((OFF + 9)) "$WORK_DIR/stock_boot/boot.img-zImage" | \
+                      gunzip 2>/dev/null > stock_ikconfig.txt
+                    if [[ -s stock_ikconfig.txt ]] && [[ $(wc -l < stock_ikconfig.txt) -gt 100 ]]; then
+                      echo "L3 ✓ strings + gunzip: $(wc -l < stock_ikconfig.txt) 行"
+                      EXTRACT_OK=true
+                    else
+                      echo "  L3 ✗ gunzip 失败或输出过短"
+                      rm -f stock_ikconfig.txt
+                    fi
+                  else
+                    echo "  L3 ✗ 未找到 IKCFG_ST 标记"
+                  fi
+                fi
+                rm -f "$TMP_BIN"
+              fi
+
+              if $EXTRACT_OK; then
                 echo "stock .config 提取成功: $(wc -l < stock_ikconfig.txt) 行"
                 head -5 stock_ikconfig.txt
+                # 提取成功的额外健康检查:含 CONFIG_LOCALVERSION 等关键项
+                if ! grep -q "^CONFIG_" stock_ikconfig.txt; then
+                  echo "  ::warning::提取的 config 不含任何 CONFIG_ 项,可能是损坏的"
+                fi
               else
-                echo "WARNING: scripts/extract-ikconfig 不存在"
+                echo "::warning::所有提取方法均失败,稍后将用 defconfig 兜底"
+                echo "  影响:驱动配置可能与原厂有差异,功能可能不完整"
+                rm -f stock_ikconfig.txt
               fi
             )
+          else
+            echo "::warning::boot.img-zImage 不存在(解包失败?),稍后用 defconfig 兜底"
           fi
 
           echo "stockboot-img=$WORK_DIR/stock-boot.img" >> "$GITHUB_OUTPUT"
@@ -912,24 +1080,75 @@ EOF_MINIMAL
           #      这是 PixelExperience / msnx 这类 fork 的标准入口
           #   2. 没有 wrapper 但有 build.sh — 用 build/build.sh 配合 BUILD_CONFIG
           #   3. 都没有 — 退到 make,自己设 DEFCONFIG
+          #
+          # 日志管控:tee 同时输出到 build.log + stdout,但 build.log 通过 FIFO
+          #         限制最大 100MB / 100000 行,避免炸 disk
+          BUILD_LOG="$WORK_DIR/build.log"
+          BUILD_LOG_LIMIT_LINES=100000
+          BUILD_LOG_LIMIT_BYTES=$((100 * 1024 * 1024))  # 100MB
+          # mkfifo 限流 + 后台进程
+          BUILD_LOG_FIFO=$(mktemp -u)
+          mkfifo "$BUILD_LOG_FIFO"
+          (
+            # 消费者:从 FIFO 读,限行数 + 字节数
+            line_count=0
+            byte_count=0
+            : > "$BUILD_LOG"
+            while IFS= read -r line; do
+              printf '%s\n' "$line" >> "$BUILD_LOG"
+              line_count=$((line_count + 1))
+              byte_count=$((byte_count + ${#line} + 1))
+              # 超过字节限制,后续只保留尾部
+              if [[ $byte_count -gt $BUILD_LOG_LIMIT_BYTES ]]; then
+                echo "[build.log 已达 100MB 限制,后续仅保留尾部]" >> "$BUILD_LOG"
+                byte_count=0
+                line_count=0
+              fi
+              if [[ $line_count -gt $BUILD_LOG_LIMIT_LINES ]]; then
+                # 滚动:保留后半段
+                tail -n $((BUILD_LOG_LIMIT_LINES / 2)) "$BUILD_LOG" > "$BUILD_LOG.tmp"
+                mv "$BUILD_LOG.tmp" "$BUILD_LOG"
+                echo "[build.log 已达 $BUILD_LOG_LIMIT_LINES 行,已滚动]" >> "$BUILD_LOG"
+                line_count=$((BUILD_LOG_LIMIT_LINES / 2))
+              fi
+            done < "$BUILD_LOG_FIFO"
+          ) &
+          LOG_LIMITER_PID=$!
+          trap "kill $LOG_LIMITER_PID 2>/dev/null; rm -f '$BUILD_LOG_FIFO'" EXIT
+
           if [[ -n "$BUILD_WRAPPER" ]] && [[ -f "$BUILD_WRAPPER" ]]; then
             echo "→ 用 wrapper: bash $BUILD_WRAPPER"
-            bash "$BUILD_WRAPPER" 2>&1 | tee "$WORK_DIR/build.log"
+            bash "$BUILD_WRAPPER" > "$BUILD_LOG_FIFO" 2>&1
           elif [[ -x ./build/build.sh ]] || [[ -f ./build/build.sh ]]; then
             echo "→ 用 build/build.sh + BUILD_CONFIG=$BUILD_CONFIG"
-            ./build/build.sh 2>&1 | tee "$WORK_DIR/build.log"
+            ./build/build.sh > "$BUILD_LOG_FIFO" 2>&1
           else
             echo "→ 没有 build.sh,直接 make"
             make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                  CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
                  O=out -j"$(nproc)" \
                  ${DEFCONFIG_NAME:-floral_defconfig} olddefconfig \
-                 2>&1 | tee "$WORK_DIR/build.log"
+                 > "$BUILD_LOG_FIFO" 2>&1
             make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                  CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
                  O=out -j"$(nproc)" \
-                 Image.gz-dtb dtbo.img modules 2>&1 | tee -a "$WORK_DIR/build.log"
+                 Image.gz-dtb dtbo.img modules >> "$BUILD_LOG_FIFO" 2>&1
           fi
+          BUILD_RC=$?
+
+          # 关闭 FIFO,等后台限流进程退出
+          exec 3>&- 2>/dev/null || true
+          sleep 2
+          wait $LOG_LIMITER_PID 2>/dev/null || true
+          rm -f "$BUILD_LOG_FIFO"
+          trap - EXIT
+
+          if [[ $BUILD_RC -ne 0 ]]; then
+            echo "::error::编译失败(返回码 $BUILD_RC),build.log 尾部:"
+            tail -n 100 "$BUILD_LOG"
+            exit $BUILD_RC
+          fi
+          echo "✓ 编译完成,build.log 大小: $(du -h "$BUILD_LOG" | awk '{print $1}')"
 
           echo "==== 产物 ===="
           ls -lh out/arch/arm64/boot/ 2>/dev/null || {
@@ -941,6 +1160,61 @@ EOF_MINIMAL
           echo ""
           echo "==== ccache(编译后)===="
           ccache -s
+
+          # ===== 编译产物强校验(防止 Image 大小异常或符号缺失) =====
+          IMAGE_FILE="out/arch/arm64/boot/Image.gz-dtb"
+          if [[ ! -f "$IMAGE_FILE" ]]; then
+            echo "::error::$IMAGE_FILE 不存在,编译失败"
+            tail -n 80 "$WORK_DIR/build.log" 2>/dev/null || true
+            exit 1
+          fi
+          IMG_SZ=$(stat -c%s "$IMAGE_FILE")
+          IMG_MB=$((IMG_SZ / 1024 / 1024))
+          echo "Image.gz-dtb 大小: ${IMG_MB}MB (${IMG_SZ} bytes)"
+
+          # 阈值:4.14 内核通常 18~30MB,< 15MB 视为异常
+          if [[ $IMG_SZ -lt 15728640 ]]; then
+            echo "::error::Image.gz-dtb 过小(${IMG_MB}MB < 15MB),可能编译未完成"
+            tail -n 80 "$WORK_DIR/build.log" 2>/dev/null || true
+            exit 1
+          fi
+          if [[ $IMG_SZ -gt 52428800 ]]; then
+            echo "::warning::Image.gz-dtb 较大(${IMG_MB}MB > 50MB),可能编入了未预期模块"
+          fi
+
+          # 符号校验:vmlinux 必须含 KSU 关键函数
+          if [[ -f out/vmlinux ]]; then
+            echo "==== 关键符号检查 ===="
+            MISSING_SYMBOLS=()
+            # KernelSU 核心符号(在 drivers/kernelsu/ 里)
+            for sym in ksu_handle_execveat ksu_handle_faccessat ksu_handle_newfstatat \
+                       ksu_handle_reboot ksu_module_init; do
+              if ! aarch64-linux-gnu-nm out/vmlinux 2>/dev/null | grep -q "\b${sym}\b"; then
+                MISSING_SYMBOLS+=("$sym")
+              fi
+            done
+            if [[ ${#MISSING_SYMBOLS[@]} -eq 0 ]]; then
+              echo "  ✓ KernelSU 全部关键符号已编入 vmlinux"
+            else
+              echo "  ::error::KernelSU 关键符号缺失:"
+              for s in "${MISSING_SYMBOLS[@]}"; do
+                echo "    - $s"
+              done
+              echo "  这通常意味着 KSU 集成失败或未编译进 vmlinux"
+              exit 1
+            fi
+
+            # SUSFS 符号(可选检查,有些版本导出符号)
+            SUSFS_SYMBOLS=$(aarch64-linux-gnu-nm out/vmlinux 2>/dev/null | grep -c "susfs_" || true)
+            if [[ $SUSFS_SYMBOLS -gt 5 ]]; then
+              echo "  ✓ SUSFS 符号已编入 vmlinux($SUSFS_SYMBOLS 个)"
+            else
+              echo "  ::warning::SUSFS 符号较少($SUSFS_SYMBOLS 个),可能集成不完整"
+            fi
+          else
+            echo "::warning::out/vmlinux 不存在,无法做符号级验证"
+            echo "  (单 Image 输出,部分构建配置不生成 vmlinux)"
+          fi
 
       # ============================================================
       # 打包 new-boot.img(保留原版 v2 DTB 区)
@@ -956,6 +1230,21 @@ EOF_MINIMAL
             exit 1
           fi
 
+          # new kernel 健康检查(防止编译产物损坏被刷入设备)
+          NEW_SZ=$(stat -c%s "$NEW_KERNEL")
+          echo "new kernel: $(numfmt --to=iec --suffix=B $NEW_SZ)"
+          if [[ $NEW_SZ -lt 15728640 ]]; then  # 15MB
+            echo "::error::new kernel 太小(${NEW_SZ} bytes),可能损坏"
+            exit 1
+          fi
+          # gzip magic 校验(Image.gz 是 gzip 压缩的,前 2 字节是 0x1f 0x8b)
+          HEAD_BYTES=$(head -c 2 "$NEW_KERNEL" | xxd -p)
+          if [[ "$HEAD_BYTES" != "1f8b" ]] && [[ "$HEAD_BYTES" != "fd377a5a" ]]; then
+            # 也兼容 xz 压缩
+            echo "::warning::new kernel magic 不像 gzip/xz: $HEAD_BYTES(可能是 raw Image)"
+          fi
+          echo "  ✓ new kernel 健康"
+
           # 读取 stock boot.img 的元信息
           BASE=$(cat boot.img-base 2>/dev/null | tr -d '\n')
           PAGESIZE=$(cat boot.img-pagesize 2>/dev/null | tr -d '\n')
@@ -964,6 +1253,18 @@ EOF_MINIMAL
           RAMDISK_OFFSET=$(cat boot.img-ramdisk_offset 2>/dev/null | tr -d '\n')
           TAGS_OFFSET=$(cat boot.img-tags_offset 2>/dev/null | tr -d '\n')
           SECOND_OFFSET=$(cat boot.img-second_offset 2>/dev/null | tr -d '\n')
+
+          # 元信息完整性校验(mkbootimg 必需 base/pagesize/kernel_offset)
+          for k in BASE PAGESIZE KERNEL_OFFSET; do
+            v="${!k}"
+            if [[ -z "$v" ]] || ! [[ "$v" =~ ^0x[0-9a-fA-F]+$ ]]; then
+              echo "::error::stock boot.img 元信息 $k 无效: '$v'"
+              echo "  可能是 boot.img 损坏或解包失败"
+              ls "$WORK_DIR/stock_boot/"
+              exit 1
+            fi
+          done
+          echo "stock 元信息(base/pagesize/kernel_offset)校验通过"
 
           echo "stock 元信息:"
           echo "  base=$BASE"
@@ -994,7 +1295,13 @@ EOF_MINIMAL
             $DTB_ARG \
             --output "$OUT_DIR/new-boot.img"
 
+          # 打包后校验
+          if [[ ! -f "$OUT_DIR/new-boot.img" ]] || [[ $(stat -c%s "$OUT_DIR/new-boot.img") -lt 1048576 ]]; then
+            echo "::error::new-boot.img 打包失败或过小"
+            exit 1
+          fi
           ls -lh "$OUT_DIR/new-boot.img"
+          echo "  ✓ new-boot.img 健康: $(numfmt --to=iec --suffix=B $(stat -c%s "$OUT_DIR/new-boot.img"))"
 
           # 校验
           ./unpackbootimg -i "$OUT_DIR/new-boot.img" -o $WORK_DIR/new_boot_unpacked 2>&1 | head
@@ -1090,6 +1397,28 @@ EOF_MINIMAL
           echo "下载完成: $(ls -lh "$KSUD_TMP")"
           file "$KSUD_TMP" || true
 
+          # 5.1 SHA256 校验(从 release JSON 拿期望值,防中间人/网络破损)
+          #     GitHub release asset 在 API 返回里有 digest 字段(sha256:...)
+          #     部分 release 不带 digest,则跳过校验
+          EXPECTED_SHA=$(printf '%s' "$RELEASE_JSON" | jq -r \
+            --arg name "$KSUD_ASSET" \
+            '.assets[]? | select(.browser_download_url == $name) | .digest // empty')
+          if [[ -n "$EXPECTED_SHA" ]]; then
+            # 去掉 "sha256:" 前缀
+            EXPECTED_SHA="${EXPECTED_SHA#sha256:}"
+            ACTUAL_SHA=$(sha256sum "$KSUD_TMP" | awk '{print $1}')
+            echo "期望 SHA256: $EXPECTED_SHA"
+            echo "实际 SHA256: $ACTUAL_SHA"
+            if [[ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
+              echo "::error::ksud SHA256 校验失败,可能下载损坏或被篡改"
+              rm -f "$KSUD_TMP"
+              exit 1
+            fi
+            echo "  ✓ SHA256 校验通过"
+          else
+            echo "  ::warning::release asset 未提供 digest,跳过 SHA256 校验"
+          fi
+
           # 6. 判断是单文件还是压缩包
           #    - zip:通常含 ksud + Manager.apk 的 release zip
           #    - gzip/xz:tar 归档
@@ -1143,7 +1472,11 @@ EOF_MINIMAL
           echo "==== ksud 已就绪 ===="
           ls -lh "$KSUD_FINAL"
           file "$KSUD_FINAL" || true
-          sha256sum "$KSUD_FINAL" 2>/dev/null | head -c 16 && echo "..."
+          KSUD_SHA=$(sha256sum "$KSUD_FINAL" | awk '{print $1}')
+          KSUD_SHA_SHORT="${KSUD_SHA:0:16}"
+          echo "ksud SHA256: ${KSUD_SHA}..."
+          # 持久化到 OUT_DIR 用于 build-info 调试
+          echo "$KSUD_SHA  ksud" > "$OUT_DIR/ksud.sha256"
 
           # 7. 顺手做基本健康检查(版本字符串 / 报错信息)
           if "$KSUD_FINAL" --help 2>&1 | head -5; then
@@ -1177,8 +1510,14 @@ EOF_MINIMAL
           cp "$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb" "$AK3_DIR/zImage"
 
           # 3. 复制 ramdisk(用 stock 的,通常 custom 内核不重新打包 ramdisk)
+          #    改进:同时备份到 OUT_DIR/,便于用户失败后回滚
           if [[ -f "$WORK_DIR/stock_boot/ramdisk.cpio.gz" ]]; then
             cp "$WORK_DIR/stock_boot/ramdisk.cpio.gz" "$AK3_DIR/ramdisk.cpio.gz" 2>/dev/null || true
+            # 备份到产物目录(若后续刷机失败,用户可用此回滚)
+            if [[ ! -f "$OUT_DIR/ramdisk-stock-backup.cpio.gz" ]]; then
+              cp "$WORK_DIR/stock_boot/ramdisk.cpio.gz" "$OUT_DIR/ramdisk-stock-backup.cpio.gz"
+              echo "  ✓ ramdisk 备份: $OUT_DIR/ramdisk-stock-backup.cpio.gz"
+            fi
           fi
 
           # 4. 复制 dtb(保留原厂 v2 DTB)
@@ -1253,6 +1592,8 @@ EOF_MINIMAL
           name: build-info-${{ github.sha }}
           path: |
             ${{ env.WORK_DIR }}/build.log
+            ${{ env.OUT_DIR }}/ksud.sha256
+            ${{ env.OUT_DIR }}/ramdisk-stock-backup.cpio.gz
           retention-days: 7
           if-no-files-found: warn
 
@@ -1294,6 +1635,9 @@ EOF_MINIMAL
           CORAL_HEAD: ${{ steps.bakasu.outputs.coral-head }}
           KSUD_TAG: ${{ steps.ksud-dl.outputs.ksud-tag }}
         run: |
+          # 计算产物 SHA256(用于 release notes 完整性)
+          NEW_BOOT_SHA=$(sha256sum "$OUT_DIR/new-boot.img" 2>/dev/null | awk '{print $1}' || echo N/A)
+          KSUD_SHA=$(cat "$OUT_DIR/ksud.sha256" 2>/dev/null | awk '{print $1}' || echo N/A)
           printf '%s\n' \
             '## Pixel 4XL (coral) 内核构建' \
             '' \
@@ -1308,9 +1652,19 @@ EOF_MINIMAL
             "- **ksud**: ${KSUD_TAG:-N/A}" \
             "- **Linux kernel**: $(cat $KERNEL_DIR/include/config/kernel.release 2>/dev/null || echo N/A)" \
             '' \
+            '### 产物 SHA256(校验完整性)' \
+            "- \`new-boot.img\`: \`${NEW_BOOT_SHA}\`" \
+            "- \`ksud\`: \`${KSUD_SHA}\`" \
+            '' \
             '### 产物' \
             '- `new-boot.img` — boot 镜像,保留原厂 v2 DTB' \
             '- `AnyKernel3-coral-*.zip` — TWRP 卡刷包(内置 ksud)' \
+            '' \
+            '### 校验命令' \
+            '```sh' \
+            'sha256sum new-boot.img' \
+            'echo "期望: '"${NEW_BOOT_SHA}"'"' \
+            '```' \
             '' \
             '### 刷机方法' \
             '1. TWRP recovery → Install → 选 zip' \
