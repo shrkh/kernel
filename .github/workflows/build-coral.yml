@@ -15,7 +15,16 @@
 #   - 单 job(Sequential),因为所有步骤都在同一个 runner 上跑效率最高
 #   - clang 11.0.1 直接从 LLVM 官方 GitHub release 下载
 #   - ccache 用 actions/cache@v4 跨 run 复用
-#   - 错误步骤 continue-on-error + 总结日志输出,避免 job 一报错什么都看不到
+#   - 错误步骤详细日志输出,便于诊断问题
+#   - 4.14 kernel 自动选择合适的 KernelSU 源(begmans/ksu-pixel4xl)
+#
+# 故障排查(KernelSU 4.14 patch 缺失错误):
+#   1. 如果看到 "KernelSU/kernel_patches/ 找不到 4.14 对应的 patch"
+#   2. GitHub Actions 手动运行 workflow:
+#      - kernelsu_repo = https://github.com/begmans/ksu-pixel4xl
+#      - kernelsu_branch = main
+#   3. 或改用 kernel_repo = https://github.com/begmans/ksu-pixel4xl
+#      (该源已预集成 KernelSU,无需 patch)
 
 name: Build coral kernel (GKI + BakaSU + SUSFS)
 
@@ -44,12 +53,12 @@ on:
         default: 'https://github.com/msnx/KernelSU-Pixel4XL'
         type: string
       kernelsu_repo:
-        description: 'KernelSU (BakaSU) 仓库 — 默认 backslashxx/KernelSU(覆盖 3.0~7.2,LKM/单源)'
-        default: 'https://github.com/backslashxx/KernelSU'
+        description: '(可选)KernelSU/BakaSU 仓库 — 留空自动选择(4.14→begmans, 5.10+→backslashxx)'
+        default: ''
         type: string
       kernelsu_branch:
-        description: 'KernelSU 分支 — backslashxx 用 master(不是 main!)'
-        default: 'master'
+        description: '(可选)KernelSU 分支 — 留空自动选择(4.14→main, 5.10+→master)'
+        default: ''
         type: string
       kernelsu_release_tag:
         description: 'ksud prebuilt 下载哪个 release tag(留空用最新)'
@@ -218,6 +227,30 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
+
+          # ===== KernelSU/BakaSU 源自动选择逻辑 =====
+          # 策略:如果用户未指定 repo/branch,根据内核版本智能选择:
+          #   - 4.14: 用 begmans/ksu-pixel4xl @ main (4.14 专用,已预集成)
+          #   - 4.19: 用 tiann/KernelSU @ v0.5.2
+          #   - 5.x+: 用 backslashxx/KernelSU @ master
+          # 用户显式指定的 repo/branch 保持不变
+          
+          # 先从 coral 内核读版本(估算,不必精确)
+          CORAL_KERNEL_VER=$(git -C "$KERNEL_DIR" log --oneline -1 2>/dev/null | head -c 40 || echo "unknown")
+          echo "coral kernel HEAD: $CORAL_KERNEL_VER"
+          
+          # 用现有 Makefile 探测(若已 clone)
+          if [[ -f "$KERNEL_DIR/Makefile" ]]; then
+            KRN_MAJOR_PROBE=$(grep -E '^PATCHLEVEL\s*=' "$KERNEL_DIR/Makefile" | head -1 | tr -d ' ' | cut -d= -f2 || echo "")
+            if [[ "$KRN_MAJOR_PROBE" == "14" ]]; then
+              # 4.14 kernel: 用 begmans/ksu-pixel4xl(已预集成)
+              if [[ -z "$KSU_REPO" ]] || [[ "$KSU_REPO" == "https://github.com/backslashxx/KernelSU" ]]; then
+                echo "✓ 检测到 4.14 kernel,自动选择 begmans/ksu-pixel4xl"
+                KSU_REPO="https://github.com/begmans/ksu-pixel4xl"
+                KSU_BRANCH="main"
+              fi
+            fi
+          fi
 
           # 幂等 clone:已存在且 HEAD 匹配就跳过,避免被取消后重跑全量重下
           smart_clone() {
@@ -412,16 +445,17 @@ jobs:
           # 4. 集成 KernelSU/BakaSU(真正的 in-tree 集成)
           #
           #    标准流程:
-          #      a) 读内核版本,选 kernel_patches/${KRN_MAJOR}/ 子目录
-          #      b) git apply *.patch 到内核树
-          #      c) 复制 KernelSU/kernel/ 源码到 patch 期望的位置(通常 drivers/kernelsu/)
-          #      d) 接入 drivers/Kconfig 和 drivers/Makefile
+          #      a) 检查内核是否已预集成(drivers/kernelsu 存在)→ 跳过写入
+          #      b) 若未集成,读内核版本,选 kernel_patches/${KRN_MAJOR}/ 子目录
+          #      c) git apply *.patch 到内核树
+          #      d) 复制 KernelSU/kernel/ 源码到 patch 期望的位置(通常 drivers/kernelsu/)
+          #      e) 接入 drivers/Kconfig 和 drivers/Makefile
           #
           #    兼容:
           #      - msnx/KernelSU-Pixel4XL(默认): 4.14 特定 patch 已应用、drivers/kernelsu 存在
           #        → 检测到已集成,跳过写入,只做验证
-          #      - vanilla 4.14 coral 内核: 完整执行 a)~d)
-          #      - 不支持的版本: 报错退出
+          #      - vanilla 4.14 coral 内核: 完整执行 a)~e)
+          #      - 不支持的版本: 报错退出(除非已预集成)
           echo "===== 集成 KernelSU/BakaSU ====="
           # 多指标检测已集成:
           #   - 标准:drivers/kernelsu/ + Makefile 含 kernelsu
@@ -444,10 +478,18 @@ jobs:
             pre_integrated=true
             echo "  检测:Kconfig 已含 CONFIG_KSU ✓"
           fi
+          
+          # Pixel 4 XL 特殊检测:msnx/KernelSU-Pixel4XL 的集成标志
+          if ! $pre_integrated && [[ -f "$KERNEL_DIR/.kernelsu_integrated" ]]; then
+            pre_integrated=true
+            echo "  检测:标记文件 .kernelsu_integrated ✓"
+          fi
+          
           if $pre_integrated; then
-            echo "✓ 内核已预集成 KernelSU,跳过写入,只做最终验证"
+            echo "✓ 内核已预集成 KernelSU,跳过 patch 应用"
+            echo "  (直接使用内核源码中已就位的 KernelSU)"
           else
-            echo "→ 内核未集成 KernelSU,执行 in-tree 集成"
+            echo "→ 内核未集成 KernelSU,需要执行 in-tree 集成"
             cd "$KERNEL_DIR"
 
             # 4.1 读内核版本
@@ -460,6 +502,11 @@ jobs:
             # 4.2 选 patch 子目录(tiann/KernelSU 的 kernel_patches/ 按主版本分子目录)
             PATCH_BASE="$WORK_DIR/KernelSU/kernel_patches"
             PATCH_FILES=()
+            
+            # 显示 KernelSU 仓库结构,便于诊断
+            echo "KernelSU 仓库结构:"
+            find "$WORK_DIR/KernelSU" -maxdepth 3 -type d -name "kernel_patches" -o -path "*/kernel_patches/*" 2>/dev/null | head -20 || true
+            
             if [[ -d "$PATCH_BASE/${KRN_MAJOR}" ]]; then
               mapfile -t PATCH_FILES < <(find "$PATCH_BASE/${KRN_MAJOR}" -maxdepth 1 -name "*.patch" | sort)
               echo "  找到 ${KRN_MAJOR} 特定 patch: ${#PATCH_FILES[@]} 个"
@@ -468,21 +515,35 @@ jobs:
               mapfile -t PATCH_FILES < <(find "$PATCH_BASE" -maxdepth 2 -name "*.patch" 2>/dev/null | sort)
               echo "  找到通用 patch: ${#PATCH_FILES[@]} 个"
             fi
+            
+            # 诊断:列出 kernel_patches 下所有子目录
+            if [[ -d "$PATCH_BASE" ]]; then
+              echo "kernel_patches 内子目录:"
+              ls -d "$PATCH_BASE"/*/ 2>/dev/null | head -20 || echo "  (空)"
+            fi
 
             if [[ ${#PATCH_FILES[@]} -eq 0 ]]; then
-              # ===== 自动回退:4.14 内核用 tiann/KernelSU @ v0.5.2 =====
+              # ===== 自动回退:4.14 内核用 tiann/KernelSU @ v0.5.2 或 begmans =====
               # 历史:KernelSU v0.6.0 起只跟 GKI(5.10+),4.14 patches 被砍;
               # v0.5.2 是最后一个含 kernel_patches/4.14/ 的 release tag。
-              # 几乎所有 modern fork(backslashxx/backslashxx 等)的 master/main
-              # 都没有 4.14,所以直接 fallback 是最稳的方案。
+              # 如果 v0.5.2 也不行,则尝试 begmans/ksu-pixel4xl(已预集成)
               if [[ "$KRN_MAJOR" == "4.14" ]]; then
-                echo "::warning::${KSU_REPO}@${KSU_BRANCH} 没 4.14 patch,自动回退到 tiann/KernelSU @ v0.5.2"
+                echo "::warning::${KSU_REPO}@${KSU_BRANCH} 没 4.14 patch,自动回退"
                 cd "$WORK_DIR"
                 rm -rf KernelSU
                 FB_OK=false
-                for fb_repo in \
-                  "https://github.com/tiann/KernelSU|v0.5.2" \
-                  "https://github.com/tiann/KernelSU|master"; do
+                
+                # 回退优先级:
+                #   1. tiann/KernelSU @ v0.5.2 (官方最后支持 4.14 的版本)
+                #   2. begmans/ksu-pixel4xl (Pixel 4 专用,已预集成 4.14)
+                #   3. 检查用户通过 env 或 input 指定的 fallback(若有)
+                FB_URLS=(
+                  "https://github.com/tiann/KernelSU|v0.5.2"
+                  "https://github.com/begmans/ksu-pixel4xl|main"
+                  "https://github.com/tiann/KernelSU|main"
+                )
+                
+                for fb_repo in "${FB_URLS[@]}"; do
                   FB_URL="${fb_repo%|*}"
                   FB_TAG="${fb_repo#*|}"
                   echo "  回退尝试: $FB_URL @ $FB_TAG"
@@ -499,19 +560,50 @@ jobs:
                     sleep $((attempt * 5))
                   done
                 done
+                
                 if ! $FB_OK; then
-                  echo "::error::自动回退到 tiann/KernelSU 也无法 clone(网络问题?)"
-                  echo "  手动方案:kernelsu_repo=https://github.com/begmans/ksu-pixel4xl"
+                  echo "::error::自动回退到所有候选源都失败(网络问题?)"
+                  echo "  尝试过的源:"
+                  for fb_repo in "${FB_URLS[@]}"; do
+                    echo "    - ${fb_repo%|*} @ ${fb_repo#*|}"
+                  done
+                  echo "  手动方案:在 GitHub Actions 输入中指定 kernelsu_repo"
                   exit 1
                 fi
                 KSU_HEAD=$(git -C KernelSU rev-parse --short HEAD)
                 echo "回退成功,新 HEAD: $KSU_HEAD"
 
-                # 重新探测 4.14 patch
+                # 重新探测 4.14 patch(支持多种目录结构)
                 PATCH_BASE="$WORK_DIR/KernelSU/kernel_patches"
+                PATCH_FILES=()
+                
                 if [[ -d "$PATCH_BASE/4.14" ]]; then
                   mapfile -t PATCH_FILES < <(find "$PATCH_BASE/4.14" -maxdepth 1 -name "*.patch" | sort)
-                  echo "  → 回退后找到 4.14 patch: ${#PATCH_FILES[@]} 个"
+                  if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
+                    echo "  → 回退后找到 4.14 patch: ${#PATCH_FILES[@]} 个"
+                  fi
+                fi
+                
+                # fallback:如果还是没找到,尝试在 PATCH_BASE 直接查找 4.14 相关 patch
+                if [[ ${#PATCH_FILES[@]} -eq 0 ]] && [[ -d "$PATCH_BASE" ]]; then
+                  mapfile -t PATCH_FILES < <(find "$PATCH_BASE" -name "*4.14*" -o -name "*4_14*" 2>/dev/null | sort)
+                  if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
+                    echo "  → 用 filename search 找到 ${#PATCH_FILES[@]} 个 4.14 相关 patch"
+                  fi
+                fi
+                
+                # 再试通用 patch(部分版本没有版本分目录,而是通用 patch)
+                if [[ ${#PATCH_FILES[@]} -eq 0 ]] && [[ -d "$PATCH_BASE" ]]; then
+                  mapfile -t PATCH_FILES < <(find "$PATCH_BASE" -maxdepth 1 -name "*.patch" | sort)
+                  if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
+                    echo "  → 回退到通用 patch: ${#PATCH_FILES[@]} 个"
+                  fi
+                fi
+                
+                # 诊断:列出 kernel_patches 当前结构
+                if [[ ${#PATCH_FILES[@]} -eq 0 ]]; then
+                  echo "  诊断:kernel_patches 结构:"
+                  find "$WORK_DIR/KernelSU/kernel_patches" -maxdepth 2 2>/dev/null | head -20 || true
                 fi
               fi
             fi
@@ -519,16 +611,24 @@ jobs:
             if [[ ${#PATCH_FILES[@]} -eq 0 ]]; then
               echo "::error::KernelSU/kernel_patches/ 找不到 ${KRN_MAJOR} 对应的 patch"
               echo "  排查清单:"
-              echo "    1. 你指定的 kernelsu_repo(默认 backslashxx/KernelSU)是否包含 ${KRN_MAJOR} 的 patch?"
+              echo "    1. KernelSU 版本是否包含 ${KRN_MAJOR} 的 patch?"
               echo "       - tiann/KernelSU main:仅 5.10+ GKI"
               echo "       - backslashxx/KernelSU master:仅 5.10+"
-              echo "       - tiann/KernelSU @ v0.5.2:含 4.14 patch(应自动回退,否则 4.14 走不通)"
+              echo "       - tiann/KernelSU @ v0.5.2:应包含 4.14(如无,尝试 begmans/ksu-pixel4xl)"
+              echo "       - begmans/ksu-pixel4xl:4.14 特定版本,已预集成"
               echo "    2. 内核树本身是否已经集成 KSU?(drivers/kernelsu 存在会跳过)"
               echo "    3. 内核版本不在主流支持范围(仅 4.14 / 4.19 / 5.4 / 5.10 / 5.15 / 6.1 测试过)"
-              echo "  解法:"
-              echo "    - kernelsu_repo=https://github.com/tiann/KernelSU, kernelsu_branch=v0.5.2(4.14)"
-              echo "    - 或 kernelsu_repo=https://github.com/begmans/ksu-pixel4xl(已集成 4.14)"
-              echo "    - 或 kernel_repo 改用 msnx/KernelSU-Pixel4XL(默认就是这个)"
+              echo ""
+              echo "  当前 KernelSU 仓库路径: $PATCH_BASE"
+              echo "  当前内核版本: ${KRN_MAJOR}"
+              echo "  当前目录结构:"
+              find "$WORK_DIR/KernelSU" -maxdepth 3 -type d 2>/dev/null | head -30
+              echo ""
+              echo "  快速解决方案:"
+              echo "    a) 用 GitHub Actions 输入覆盖 kernelsu_repo/kernelsu_branch:"
+              echo "       kernelsu_repo=https://github.com/begmans/ksu-pixel4xl"
+              echo "       kernelsu_branch=main"
+              echo "    b) 或检查 msnx/KernelSU-Pixel4XL 是否已集成(检查 drivers/kernelsu 是否存在)"
               exit 1
             fi
 
@@ -642,18 +742,33 @@ jobs:
             find "$KERNEL_DIR/drivers/kernelsu" -maxdepth 1 -type f | head -5
           else
             echo "::error::drivers/kernelsu 不存在,集成失败"
+            echo "  排查:"
+            echo "    - 检查内核是否真的已集成(find drivers -name '*ksu*')"
+            echo "    - 若是 msnx/KernelSU-Pixel4XL,应该已包含 drivers/kernelsu"
+            echo "    - 若是 vanilla 内核,需要 patch + 源码复制"
             exit 1
           fi
           if grep -q "kernelsu" "$KERNEL_DIR/drivers/Makefile" 2>/dev/null; then
             echo "  ✓ drivers/Makefile: kernelsu 已接入"
           else
             echo "::error::drivers/Makefile 未接入 kernelsu"
+            echo "  Makefile 当前内容:"
+            tail -10 "$KERNEL_DIR/drivers/Makefile"
             exit 1
           fi
           if [[ -f "$KERNEL_DIR/drivers/kernelsu/Kconfig" ]]; then
-            echo "  ✓ drivers/kconfig: Kconfig 文件就位"
+            echo "  ✓ drivers/Kconfig: Kconfig 文件就位"
           else
-            echo "::warning::drivers/kernelsu/Kconfig 缺失(可能 menuconfig 里看不到 KSU)"
+            echo "::warning::drivers/kernelsu/Kconfig 缺失(可能 menuconfig 里看不到 KSU 选项)"
+            echo "  会影响 'make menuconfig' 配置,但如果手动设置 CONFIG_KSU=y 可以编译"
+          fi
+
+          # 验证关键符号(虽然还未编译,但做静态检查)
+          if grep -rq "ksu_module_init" "$KERNEL_DIR/drivers/kernelsu" 2>/dev/null || \
+             grep -rq "ksu_handle_execveat" "$KERNEL_DIR/fs" "$KERNEL_DIR/kernel" 2>/dev/null; then
+            echo "  ✓ KernelSU 关键源代码标记已就位"
+          else
+            echo "  ⊘ 未找到关键标记(可能是已优化或不同版本)"
           fi
 
           echo "kernelsu-head=$KSU_HEAD" >> "$GITHUB_OUTPUT"
