@@ -250,54 +250,152 @@ jobs:
           CORAL_HEAD=$(smart_clone "$KERNEL_REPO" "$KERNEL_BRANCH" "$KERNEL_DIR")
           echo "coral HEAD: $CORAL_HEAD"
 
-          # 3. 备份并选择 build.config(去掉私有 device tree 引用)
+          # 3. 备份并选择 build.config
+          #
+          # Pixel 4 XL 4.14 仓库存放方式有两种:
+          #   A. 标准 AOSP(common kernel):build/build.config.* 在 build/ 子目录
+          #   B. PixelExperience/msnx 等 fork:build.config.* 在仓库根目录,且配 build_floral.sh
+          #      wrapper — 这种必须用 wrapper(里面设 BUILD_CONFIG=private/msm-google/...)
+          #      wrapper 是 Google 内部 build 期望的入口
           cd "$KERNEL_DIR"
-          # 备份(若有)
-          for cfg in build.config.coral build.config.floral build.config.gki; do
+          # 备份(若有)— 在两处都查
+          for cfg in build.config.coral build.config.floral build.config.gki \
+                     build.config.aarch64 build.config.common; do
             [[ -f "build/$cfg" ]] && cp "build/$cfg" "build/$cfg.bak" 2>/dev/null || true
+            [[ -f "$cfg" ]]      && cp "$cfg"      "$cfg.bak"      2>/dev/null || true
           done
-          # 优先用 GKI(没有私有依赖),其次 coral/floral(可能有 private/google-modules)
-          # 关键修复:之前 build.config.gki 不存在时,会硬写一个引用 build.config.gki 的 fallback,
-          # 但 msnx 仓库根本没有 build.config.gki → 后面 build.sh 会报 file not found
-          if [[ -f build/build.config.gki ]]; then
-            ln -sf build/build.config.gki build.config
-            echo "→ build.config -> build.config.gki(标准 GKI)"
-          elif [[ -f build/build.config.coral ]]; then
-            # coral 内核配置,但里面通常 ${ROOT_DIR}/build.config.coral 自身;
-            # msnx 这类 fork 通常已经把 private/google-modules 处理掉,
-            # 直接 link 即可,不要重写内容
-            if grep -q "private/google-modules\|private/msm-google" build/build.config.coral; then
-              echo "::warning::build.config.coral 引用 private/google-modules,尝试走 GKI 替代"
-              # 看看 gki 是不是被 include 进来的(变体常这样写)
-              if grep -q "build.config.gki" build/build.config.coral; then
-                :  # 没问题,正常 include
-              else
-                # 真的引用了私有 device tree — 退到 floral,若 floral 也引就报错
-                if [[ -f build/build.config.floral ]] && \
-                   ! grep -q "private/" build/build.config.floral; then
-                  ln -sf build/build.config.floral build.config
-                  echo "→ build.config -> build.config.floral(避开 private 引用)"
-                else
-                  echo "::error::build.config.coral/floral 都引用私有 device tree,本 runner 没法获取"
-                  echo "  改用 GKI-only 内核树(github.com/begmans/ksu-pixel4xl-gki)或预集成 fork"
-                  exit 1
-                fi
+
+          # 探测函数:在指定目录里找带特定后缀的 build.config
+          find_bc() {
+            # $1 = dir, $2 = suffix (coral|floral|sunfish|gki|aarch64)
+            local dir="$1" suffix="$2"
+            local candidates=(
+              "$dir/build.config.$suffix"
+              "$dir/build.config.${suffix}_no-cfi"
+              "$dir/build.config.${suffix}_performance"
+              "$dir/build.config"
+            )
+            for c in "${candidates[@]}"; do
+              [[ -f "$c" ]] && { echo "$c"; return 0; }
+            done
+            return 1
+          }
+
+          # 探测默认 defconfig(floral/sunfish 等)— 后面 KSU 集成和 config 步骤要用
+          DEFCONFIG_NAME=""
+          for guess in floral_defconfig coral_defconfig sunfish_defconfig; do
+            if grep -q "^CONFIG_BOARD_${guess%%_*}" .config 2>/dev/null || \
+               [[ -f "arch/arm64/configs/${guess}" ]]; then
+              DEFCONFIG_NAME="$guess"
+              break
+            fi
+          done
+          DEFCONFIG_NAME="${DEFCONFIG_NAME:-floral_defconfig}"
+          echo "→ DEFCONFIG 探测结果: $DEFCONFIG_NAME"
+
+          # 选 build.config
+          # 优先级:
+          #   1. wrapper 脚本(build_floral.sh / build_sunfish.sh)— msnx / PixelExperience 仓专用
+          #   2. build/ 下的 build.config.{coral,floral,sunfish,gki}(标准 AOSP 布局)
+          #   3. 根目录下的 build.config.{coral,floral,sunfish}(fork 布局)
+          #   4. 兜底:用 ${DEFCONFIG_NAME%_defconfig} 拼一个 minimal build.config
+          BUILD_CONFIG_REL=""
+          USE_WRAPPER=""
+          for sfx in floral sunfish coral gki aarch64; do
+            for wrapper_name in build_${sfx}.sh; do
+              if [[ -x "./$wrapper_name" ]] || [[ -f "./$wrapper_name" ]]; then
+                USE_WRAPPER="./$wrapper_name"
+                # wrapper 内部用的是相对路径 BUILD_CONFIG=private/msm-google/...
+                # 我们记录下,后续直接 export BUILD_CONFIG
+                BUILD_CONFIG_REL="private/msm-google/build.config.${sfx}_no-cfi"
+                echo "→ 找到 wrapper: $wrapper_name(将用它调用 build.sh)"
+                break 2
               fi
+            done
+          done
+
+          if [[ -z "$USE_WRAPPER" ]]; then
+            # 没 wrapper,直接找 build.config
+            if [[ -f build/build.config.gki ]]; then
+              BUILD_CONFIG_REL="build/build.config.gki"
+            elif BC=$(find_bc build floral) && [[ -n "$BC" ]]; then
+              BUILD_CONFIG_REL="$BC"
+            elif BC=$(find_bc . floral) && [[ -n "$BC" ]]; then
+              BUILD_CONFIG_REL="$BC"
+            elif BC=$(find_bc . coral) && [[ -n "$BC" ]]; then
+              BUILD_CONFIG_REL="$BC"
+            elif BC=$(find_bc . sunfish) && [[ -n "$BC" ]]; then
+              BUILD_CONFIG_REL="$BC"
+            elif [[ -f build.config ]]; then
+              BUILD_CONFIG_REL="build.config"
             fi
-            # 标准情况:直接 link coral
-            if [[ ! -L build.config ]]; then
-              ln -sf build/build.config.coral build.config
-              echo "→ build.config -> build.config.coral"
-            fi
-          elif [[ -f build/build.config.floral ]]; then
-            ln -sf build/build.config.floral build.config
-            echo "→ build.config -> build.config.floral"
-          else
-            echo "::error::找不到任何 build.config.{coral,floral,gki},无法构建"
-            exit 1
           fi
-          echo "---- 当前 build.config ----"
-          cat build.config
+
+          if [[ -z "$BUILD_CONFIG_REL" ]]; then
+            # 兜底:写一个 minimal build.config(用 floral_defconfig)
+            # — 仅在没有 build.sh / build/build.sh 时才走,否则 build.sh 会因为缺私有 module 挂
+            # 引号 heredoc 防 ${} 被 YAML 解析(虽然 run: | 应该没问题,但双保险)
+            cat > build.config <<'EOF_MINIMAL'
+            DEFCONFIG=__DEFCONFIG__
+            EOF_MINIMAL
+            sed -i "s|__DEFCONFIG__|${DEFCONFIG_NAME}|" build.config
+            echo "::warning::没找到 build.config.* 也没 wrapper,写了一个 minimal:DEFCONFIG=${DEFCONFIG_NAME}"
+            echo "  这通常意味着 kernel_repo 不完整(缺少 private/msm-google 私有模块)"
+            echo "  建议改用完整 AOSP manifest:kernel_repo 保持默认,改用 repo 工具初始化"
+            cat build.config
+          else
+            # 兼容老代码的 build.config 软链(部分旧 patch 会检查这个)
+            if [[ ! -e build.config ]] && [[ ! -L build.config ]]; then
+              ln -sf "$BUILD_CONFIG_REL" build.config
+              echo "→ build.config -> $BUILD_CONFIG_REL(软链,兼容)"
+            fi
+            echo "→ BUILD_CONFIG=$BUILD_CONFIG_REL"
+            if [[ -n "$USE_WRAPPER" ]]; then
+              echo "→ 调用方式:$USE_WRAPPER(里面会设 BUILD_CONFIG 并调 build/build.sh)"
+            fi
+            echo "---- 当前 build.config 内容 ----"
+            cat "$BUILD_CONFIG_REL" 2>/dev/null | head -20 || true
+          fi
+
+          # ===== 处理 private/msm-google 缺失 =====
+          # 现实:PixelExperience / msnx 这类 fork 的 build.config 都引用
+          # ${KERNEL_DIR}/build.config.xxx(默认 KERNEL_DIR=private/msm-google),
+          # 而该目录在公开 fork 中根本不存在 — 没有 Google 私有模块。
+          # 解决:临时建一个 private/msm-google/ 空壳,把所有 build.config.* 软链
+          # 过去,让 build.sh 跑得通(虽然 wlan.ko 等私有 .ko 不会生成,但能
+          # 编出 Image.lz4-dtb;boot 可能因缺 wifi 驱动而部分功能受限)
+          if [[ -d "$KERNEL_DIR/private/msm-google" ]]; then
+            echo "→ private/msm-google/ 存在(完整 AOSP 布局,直接编译)"
+          else
+            echo "::warning::private/msm-google/ 不存在 — 这是公开 fork 的常见情况"
+            mkdir -p "$KERNEL_DIR/private/msm-google"
+            # 把根目录的 build.config.* 软链到 private/msm-google/
+            # 这样 BUILD_CONFIG=private/msm-google/build.config.floral_no-cfi 能找到
+            shopt -s nullglob
+            for cfg in "$KERNEL_DIR"/build.config.*; do
+              [[ -f "$cfg" ]] || continue
+              bn=$(basename "$cfg")
+              [[ ! -e "$KERNEL_DIR/private/msm-google/$bn" ]] && \
+                ln -sf "../../$bn" "$KERNEL_DIR/private/msm-google/$bn"
+            done
+            shopt -u nullglob
+            # 私有 vendor 目录也建空壳(部分 build.config 会 source 它们)
+            for subdir in techpack/audio techpack/camera techpack/dataipa \
+                          techpack/display techpack/video \
+                          vendor/qcom/opensource/audio-kernel \
+                          vendor/qcom/opensource/camera-kernel \
+                          vendor/qcom/opensource/dataipa; do
+              mkdir -p "$KERNEL_DIR/$subdir"
+            done
+            echo "  已建 private/msm-google/ 壳 + 软链所有 build.config.*"
+            echo "  注意:私有 vendor .ko(wlan.ko 等)不会编出,boot 可能跑不全 wifi/相机等"
+            echo "  完整方案:用 AOSP 'repo' 工具初始化或换含私有模块的 fork"
+          fi
+
+          # 导出给后续编译步骤用
+          echo "BUILD_CONFIG_PATH=$BUILD_CONFIG_REL"   >> "$GITHUB_ENV"
+          echo "BUILD_WRAPPER=$USE_WRAPPER"             >> "$GITHUB_ENV"
+          echo "DEFCONFIG_NAME=$DEFCONFIG_NAME"         >> "$GITHUB_ENV"
 
           # 4. 集成 KernelSU/BakaSU(真正的 in-tree 集成)
           #
@@ -746,9 +844,11 @@ jobs:
             cp stock_ikconfig.txt .config
             echo "使用 stock .config"
           else
-            echo "stock .config 不可用,用 floral_defconfig"
-            echo "(Pixel 4 / 4 XL 共用 'floral' defconfig — 见 build_coral.sh)"
-            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- floral_defconfig
+            # DEFCONFIG_NAME 由前面的步骤探测并 export 到 env(Pixel 4/4 XL 用 floral,
+            # Pixel 4a 用 sunfish,其他设备按 BOARD_* 探测)
+            DC="${DEFCONFIG_NAME:-floral_defconfig}"
+            echo "stock .config 不可用,用 $DC"
+            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- "$DC"
           fi
 
           # 2. 开启 BakaSU(KernelSU)配置
@@ -788,7 +888,9 @@ jobs:
           CXX: clang++
           CLANG_TRIPLE: aarch64-linux-gnu-
           CROSS_COMPILE: aarch64-linux-gnu-
-          BUILD_CONFIG: build.config
+          # 上一步设置的(优先用 wrapper,否则用 build.config 路径)
+          BUILD_CONFIG: ${{ env.BUILD_CONFIG_PATH }}
+          BUILD_WRAPPER: ${{ env.BUILD_WRAPPER }}
         run: |
           cd "$KERNEL_DIR"
 
@@ -801,10 +903,41 @@ jobs:
           ccache -s
 
           echo "==== 开始编译 ===="
-          ./build/build.sh 2>&1 | tee "$WORK_DIR/build.log"
+          echo "  BUILD_CONFIG=$BUILD_CONFIG"
+          echo "  BUILD_WRAPPER=$BUILD_WRAPPER"
+
+          # 三种调用方式,按优先级:
+          #   1. 有 wrapper(build_floral.sh / build_sunfish.sh)— 直接调它
+          #      wrapper 内部已经设了 BUILD_CONFIG=private/msm-google/...
+          #      这是 PixelExperience / msnx 这类 fork 的标准入口
+          #   2. 没有 wrapper 但有 build.sh — 用 build/build.sh 配合 BUILD_CONFIG
+          #   3. 都没有 — 退到 make,自己设 DEFCONFIG
+          if [[ -n "$BUILD_WRAPPER" ]] && [[ -f "$BUILD_WRAPPER" ]]; then
+            echo "→ 用 wrapper: bash $BUILD_WRAPPER"
+            bash "$BUILD_WRAPPER" 2>&1 | tee "$WORK_DIR/build.log"
+          elif [[ -x ./build/build.sh ]] || [[ -f ./build/build.sh ]]; then
+            echo "→ 用 build/build.sh + BUILD_CONFIG=$BUILD_CONFIG"
+            ./build/build.sh 2>&1 | tee "$WORK_DIR/build.log"
+          else
+            echo "→ 没有 build.sh,直接 make"
+            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+                 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+                 O=out -j"$(nproc)" \
+                 ${DEFCONFIG_NAME:-floral_defconfig} olddefconfig \
+                 2>&1 | tee "$WORK_DIR/build.log"
+            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+                 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+                 O=out -j"$(nproc)" \
+                 Image.gz-dtb dtbo.img modules 2>&1 | tee -a "$WORK_DIR/build.log"
+          fi
 
           echo "==== 产物 ===="
-          ls -lh out/arch/arm64/boot/
+          ls -lh out/arch/arm64/boot/ 2>/dev/null || {
+            echo "::error::编译后产物目录不存在"
+            echo "  最后 50 行 build.log:"
+            tail -n 50 "$WORK_DIR/build.log" 2>/dev/null || true
+            exit 1
+          }
           echo ""
           echo "==== ccache(编译后)===="
           ccache -s
